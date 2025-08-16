@@ -170,7 +170,7 @@
     <visual name="Torso_Side_Right_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="Torso_Side_Right_geometry">
-        <mesh filename="../meshes/Torso_Side_Right.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/Torso_Side_Right.stl"/>
       </geometry>
       <material name="Torso_Side_Right_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -179,7 +179,7 @@
     <collision name="Torso_Side_Right.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="Torso_Side_Right_collision_geometry">
-        <mesh filename="../meshes/Torso_Side_Right.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/Torso_Side_Right.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="Torso_Side_Right_inertial">
@@ -192,7 +192,7 @@
     <visual name="KC_C_104R_PitchHardstopDriven_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_104R_PitchHardstopDriven_geometry">
-        <mesh filename="../meshes/KC_C_104R_PitchHardstopDriven.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_104R_PitchHardstopDriven.stl"/>
       </geometry>
       <material name="KC_C_104R_PitchHardstopDriven_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -201,7 +201,7 @@
     <collision name="KC_C_104R_PitchHardstopDriven.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_104R_PitchHardstopDriven_collision_geometry">
-        <mesh filename="../meshes/KC_C_104R_PitchHardstopDriven.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_104R_PitchHardstopDriven.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_104R_PitchHardstopDriven_inertial">
@@ -214,7 +214,7 @@
     <visual name="imu_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="imu_geometry">
-        <mesh filename="../meshes/imu.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/imu.stl"/>
       </geometry>
       <material name="imu_material">
         <color rgba="0.615686 0.811765 0.929412 1"/>
@@ -223,7 +223,7 @@
     <collision name="imu.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="imu_collision_geometry">
-        <mesh filename="../meshes/imu.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/imu.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="imu_inertial">
@@ -236,7 +236,7 @@
     <visual name="KC_C_104L_PitchHardstopDriven_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_104L_PitchHardstopDriven_geometry">
-        <mesh filename="../meshes/KC_C_104L_PitchHardstopDriven.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_104L_PitchHardstopDriven.stl"/>
       </geometry>
       <material name="KC_C_104L_PitchHardstopDriven_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -245,7 +245,7 @@
     <collision name="KC_C_104L_PitchHardstopDriven.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_104L_PitchHardstopDriven_collision_geometry">
-        <mesh filename="../meshes/KC_C_104L_PitchHardstopDriven.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_104L_PitchHardstopDriven.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_104L_PitchHardstopDriven_inertial">
@@ -258,7 +258,7 @@
     <visual name="KC_D_102R_R_Hip_Yoke_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_102R_R_Hip_Yoke_Drive_geometry">
-        <mesh filename="../meshes/KC_D_102R_R_Hip_Yoke_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_102R_R_Hip_Yoke_Drive.stl"/>
       </geometry>
       <material name="KC_D_102R_R_Hip_Yoke_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -267,7 +267,7 @@
     <collision name="KC_D_102R_R_Hip_Yoke_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_102R_R_Hip_Yoke_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_102R_R_Hip_Yoke_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_102R_R_Hip_Yoke_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_102R_R_Hip_Yoke_Drive_inertial">
@@ -280,7 +280,7 @@
     <visual name="KC_D_102L_L_Hip_Yoke_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_102L_L_Hip_Yoke_Drive_geometry">
-        <mesh filename="../meshes/KC_D_102L_L_Hip_Yoke_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_102L_L_Hip_Yoke_Drive.stl"/>
       </geometry>
       <material name="KC_D_102L_L_Hip_Yoke_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -289,7 +289,7 @@
     <collision name="KC_D_102L_L_Hip_Yoke_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_102L_L_Hip_Yoke_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_102L_L_Hip_Yoke_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_102L_L_Hip_Yoke_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_102L_L_Hip_Yoke_Drive_inertial">
@@ -302,7 +302,7 @@
     <visual name="RS03_visual_3">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_geometry_3">
-        <mesh filename="../meshes/RS03_3.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_3.stl"/>
       </geometry>
       <material name="RS03_material_3">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -311,7 +311,7 @@
     <collision name="RS03.collision_3">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_collision_geometry_3">
-        <mesh filename="../meshes/RS03_3.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_3.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="RS03_inertial_3">
@@ -324,7 +324,7 @@
     <visual name="RS03_visual_4">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_geometry_4">
-        <mesh filename="../meshes/RS03_4.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_4.stl"/>
       </geometry>
       <material name="RS03_material_4">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -333,7 +333,7 @@
     <collision name="RS03.collision_4">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_collision_geometry_4">
-        <mesh filename="../meshes/RS03_4.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_4.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="RS03_inertial_4">
@@ -346,7 +346,7 @@
     <visual name="RS03_visual_5">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_geometry_5">
-        <mesh filename="../meshes/RS03_5.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_5.stl"/>
       </geometry>
       <material name="RS03_material_5">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -355,7 +355,7 @@
     <collision name="RS03.collision_5">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_collision_geometry_5">
-        <mesh filename="../meshes/RS03_5.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_5.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="RS03_inertial_5">
@@ -368,7 +368,7 @@
     <visual name="RS03_visual_6">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_geometry_6">
-        <mesh filename="../meshes/RS03_6.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_6.stl"/>
       </geometry>
       <material name="RS03_material_6">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -377,7 +377,7 @@
     <collision name="RS03.collision_6">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="RS03_collision_geometry_6">
-        <mesh filename="../meshes/RS03_6.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/RS03_6.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="RS03_inertial_6">
@@ -390,7 +390,7 @@
     <visual name="KC_C_202R_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_202R_geometry">
-        <mesh filename="../meshes/KC_C_202R.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_202R.stl"/>
       </geometry>
       <material name="KC_C_202R_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -399,7 +399,7 @@
     <collision name="KC_C_202R.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_202R_collision_geometry">
-        <mesh filename="../meshes/KC_C_202R.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_202R.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_202R_inertial">
@@ -412,7 +412,7 @@
     <visual name="KC_C_202L_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_202L_geometry">
-        <mesh filename="../meshes/KC_C_202L.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_202L.stl"/>
       </geometry>
       <material name="KC_C_202L_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -421,7 +421,7 @@
     <collision name="KC_C_202L.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_202L_collision_geometry">
-        <mesh filename="../meshes/KC_C_202L.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_202L.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_202L_inertial">
@@ -434,7 +434,7 @@
     <visual name="KC_D_301R_R_Femur_Lower_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_301R_R_Femur_Lower_Drive_geometry">
-        <mesh filename="../meshes/KC_D_301R_R_Femur_Lower_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_301R_R_Femur_Lower_Drive.stl"/>
       </geometry>
       <material name="KC_D_301R_R_Femur_Lower_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -443,7 +443,7 @@
     <collision name="KC_D_301R_R_Femur_Lower_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_301R_R_Femur_Lower_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_301R_R_Femur_Lower_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_301R_R_Femur_Lower_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_301R_R_Femur_Lower_Drive_inertial">
@@ -456,7 +456,7 @@
     <visual name="KC_D_301L_L_Femur_Lower_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_301L_L_Femur_Lower_Drive_geometry">
-        <mesh filename="../meshes/KC_D_301L_L_Femur_Lower_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_301L_L_Femur_Lower_Drive.stl"/>
       </geometry>
       <material name="KC_D_301L_L_Femur_Lower_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -465,7 +465,7 @@
     <collision name="KC_D_301L_L_Femur_Lower_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_301L_L_Femur_Lower_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_301L_L_Femur_Lower_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_301L_L_Femur_Lower_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_301L_L_Femur_Lower_Drive_inertial">
@@ -478,7 +478,7 @@
     <visual name="KC_C_401R_R_UpForearmDrive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_401R_R_UpForearmDrive_geometry">
-        <mesh filename="../meshes/KC_C_401R_R_UpForearmDrive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_401R_R_UpForearmDrive.stl"/>
       </geometry>
       <material name="KC_C_401R_R_UpForearmDrive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -487,7 +487,7 @@
     <collision name="KC_C_401R_R_UpForearmDrive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_401R_R_UpForearmDrive_collision_geometry">
-        <mesh filename="../meshes/KC_C_401R_R_UpForearmDrive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_401R_R_UpForearmDrive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_401R_R_UpForearmDrive_inertial">
@@ -500,7 +500,7 @@
     <visual name="KC_C_401L_L_UpForearmDrive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_401L_L_UpForearmDrive_geometry">
-        <mesh filename="../meshes/KC_C_401L_L_UpForearmDrive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_401L_L_UpForearmDrive.stl"/>
       </geometry>
       <material name="KC_C_401L_L_UpForearmDrive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -509,7 +509,7 @@
     <collision name="KC_C_401L_L_UpForearmDrive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_C_401L_L_UpForearmDrive_collision_geometry">
-        <mesh filename="../meshes/KC_C_401L_L_UpForearmDrive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_C_401L_L_UpForearmDrive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_C_401L_L_UpForearmDrive_inertial">
@@ -522,7 +522,7 @@
     <visual name="KC_D_401R_R_Shin_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_401R_R_Shin_Drive_geometry">
-        <mesh filename="../meshes/KC_D_401R_R_Shin_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_401R_R_Shin_Drive.stl"/>
       </geometry>
       <material name="KC_D_401R_R_Shin_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -531,7 +531,7 @@
     <collision name="KC_D_401R_R_Shin_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_401R_R_Shin_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_401R_R_Shin_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_401R_R_Shin_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_401R_R_Shin_Drive_inertial">
@@ -544,7 +544,7 @@
     <visual name="KC_D_401L_L_Shin_Drive_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_401L_L_Shin_Drive_geometry">
-        <mesh filename="../meshes/KC_D_401L_L_Shin_Drive.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_401L_L_Shin_Drive.stl"/>
       </geometry>
       <material name="KC_D_401L_L_Shin_Drive_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -553,7 +553,7 @@
     <collision name="KC_D_401L_L_Shin_Drive.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KC_D_401L_L_Shin_Drive_collision_geometry">
-        <mesh filename="../meshes/KC_D_401L_L_Shin_Drive.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KC_D_401L_L_Shin_Drive.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KC_D_401L_L_Shin_Drive_inertial">
@@ -566,7 +566,7 @@
     <visual name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop_geometry">
-        <mesh filename="../meshes/KB_C_501X_Right_Bayonet_Adapter_Hard_Stop.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_C_501X_Right_Bayonet_Adapter_Hard_Stop.stl"/>
       </geometry>
       <material name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -575,7 +575,7 @@
     <collision name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop_collision_geometry">
-        <mesh filename="../meshes/KB_C_501X_Right_Bayonet_Adapter_Hard_Stop.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_C_501X_Right_Bayonet_Adapter_Hard_Stop.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KB_C_501X_Right_Bayonet_Adapter_Hard_Stop_inertial">
@@ -588,7 +588,7 @@
     <visual name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop_geometry">
-        <mesh filename="../meshes/KB_C_501X_Left_Bayonet_Adapter_Hard_Stop.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_C_501X_Left_Bayonet_Adapter_Hard_Stop.stl"/>
       </geometry>
       <material name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -597,7 +597,7 @@
     <collision name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop_collision_geometry">
-        <mesh filename="../meshes/KB_C_501X_Left_Bayonet_Adapter_Hard_Stop.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_C_501X_Left_Bayonet_Adapter_Hard_Stop.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KB_C_501X_Left_Bayonet_Adapter_Hard_Stop_inertial">
@@ -610,7 +610,7 @@
     <visual name="KB_D_501R_R_LEG_FOOT_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_D_501R_R_LEG_FOOT_geometry">
-        <mesh filename="../meshes/KB_D_501R_R_LEG_FOOT.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_D_501R_R_LEG_FOOT.stl"/>
       </geometry>
       <material name="KB_D_501R_R_LEG_FOOT_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -619,7 +619,7 @@
     <collision name="KB_D_501R_R_LEG_FOOT.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_D_501R_R_LEG_FOOT_collision_geometry">
-        <mesh filename="../meshes/KB_D_501R_R_LEG_FOOT.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_D_501R_R_LEG_FOOT.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KB_D_501R_R_LEG_FOOT_inertial">
@@ -632,7 +632,7 @@
     <visual name="KB_D_501L_L_LEG_FOOT_visual">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_D_501L_L_LEG_FOOT_geometry">
-        <mesh filename="../meshes/KB_D_501L_L_LEG_FOOT.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_D_501L_L_LEG_FOOT.stl"/>
       </geometry>
       <material name="KB_D_501L_L_LEG_FOOT_material">
         <color rgba="0.262745 0.282353 0.301961 1"/>
@@ -641,7 +641,7 @@
     <collision name="KB_D_501L_L_LEG_FOOT.collision">
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry name="KB_D_501L_L_LEG_FOOT_collision_geometry">
-        <mesh filename="../meshes/KB_D_501L_L_LEG_FOOT.collision.stl"/>
+        <mesh filename="package://kbot-v2_descritption/meshes/KB_D_501L_L_LEG_FOOT.collision.stl"/>
       </geometry>
     </collision>
     <inertial name="KB_D_501L_L_LEG_FOOT_inertial">
