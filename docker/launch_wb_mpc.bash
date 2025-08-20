@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#
+# Usage:
+#
+# $ cd ~/your_colcon_ws/src/wb_humanoid_mpc/docker
+# $ ./launch_wb_mpc.bash    # Launch the WB Humanoid MPC Docker container
+#
+# (Cross reference this file with the "run" section of ../.devcontainer/devcontainer.json)
+#
 set -euo pipefail
 
 # Allow GUI applications
@@ -14,15 +22,12 @@ if [ ! -f "${XAUTH}" ]; then
   chmod a+r "${XAUTH}"
 fi
 
-# Host workspace root (hard‑coded)
-HOST_WS="$(realpath "${PWD}/../../..")" # your workspace root
-
+# ROOT_COLCON_WS 
+HOST_WS="$(realpath "${PWD}/../../..")"
 
 # Run the container, mounting the entire workspace
-
 docker run --rm -it \
   --name wb-mpc-dev \
-  --gpus all \
   --net host \
   --privileged \
   -u root \
@@ -38,4 +43,3 @@ docker run --rm -it \
   bash
 
 echo "Done."
-
