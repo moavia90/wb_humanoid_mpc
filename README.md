@@ -79,6 +79,15 @@ envsubst < dependencies.txt | xargs sudo apt install -y
 
 ### Building the MPC 
 
+Building the WB MPC consumes a significant amount of RAM. We recommend saving all open work before starting the first build. The RAM usage can be adjusted by setting the PARALLEL_JOBS environment variable. Our recommendation is:
+
+| PARALLEL_JOBS | Required System RAM |
+|--------------:|--------------------:|
+| 2 (default)   |  16 GiB             | 
+| 4             |  32 GiB              |
+| 6             |  64 GiB              | 
+
+
 ```bash
 make build-all
 ```
