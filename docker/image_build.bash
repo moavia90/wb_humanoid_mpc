@@ -38,3 +38,4 @@ docker build \
   "${CONTEXT}"
 
 echo "Built image: ${IMAGE_TAG}"
+
