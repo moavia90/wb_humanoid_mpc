@@ -1,0 +1,58 @@
+targetDisplacementVelocity          0.5;
+targetRotationVelocity              0.5;
+
+maxDisplacementVelocityX            2.4;
+maxDisplacementVelocityY            1.2;
+maxDeltaPelvisHeight                0.4;
+maxRotationVelocity                 1.0;
+
+defaultBaseHeight                           0.78
+
+
+defaultJointState
+{
+  (0,0)  -0.05     ; dof_left_hip_pitch_04
+  (1,0)   0.0      ; dof_left_hip_roll_03
+  (2,0)   0.0      ; dof_left_hip_yaw_03
+  (3,0)   0.1      ; dof_left_knee_04
+  (4,0)  -0.05     ; dof_left_ankle_02
+  (5,0)   0.0      ; dof_left_shoulder_pitch_03
+  (6,0)   0.0      ; dof_left_shoulder_roll_03
+  (7,0)   0.0      ; dof_left_shoulder_yaw_02
+  (8,0)   0.0      ; dof_left_elbow_02
+  (9,0)  -0.05     ; dof_right_hip_pitch_04
+  (10,0)  0.0      ; dof_right_hip_roll_03
+  (11,0)  0.0      ; dof_right_hip_yaw_03
+  (12,0)  0.1      ; dof_right_knee_04
+  (13,0) -0.05     ; dof_right_ankle_02
+  (14,0)  0.0      ; dof_right_shoulder_pitch_03
+  (15,0)  0.0      ; dof_right_shoulder_roll_03
+  (16,0)  0.0      ; dof_right_shoulder_yaw_02
+  (17,0)  0.0      ; dof_right_elbow_02
+}
+
+initialModeSchedule
+{
+  modeSequence
+  {
+    [0]  STANCE
+    [1]  STANCE
+  }
+  eventTimes
+  {
+    [0]  0.5
+  }
+}
+
+defaultModeSequenceTemplate
+{
+  modeSequence
+  {
+    [0]  STANCE
+  }
+  switchingTimes
+  {
+    [0]  0.0
+    [1]  0.5
+  }
+}
