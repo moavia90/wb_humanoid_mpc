@@ -11,7 +11,7 @@ ENV ROS_DISTRO=${ROS_DISTRO}
 
 # Install system dependencies, ROS, Python, and development tools in a single step
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl gnupg2 lsb-release software-properties-common \
+    curl coreutils gnupg2 lsb-release software-properties-common \
     locales \
     git \
     x11-apps \
@@ -25,11 +25,43 @@ RUN apt-get update && \
     envsubst < /tmp/dependencies.txt | xargs apt-get install -y --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates gnupg wget terminator \
+    && rm -rf /var/lib/apt/lists/*
+RUN wget -qO- https://drake-apt.csail.mit.edu/drake.asc | gpg --dearmor - \
+    | tee /etc/apt/trusted.gpg.d/drake.gpg >/dev/null
+
+RUN echo "deb [arch=amd64] https://drake-apt.csail.mit.edu/$(lsb_release -cs) $(lsb_release -cs) main" \
+    | tee /etc/apt/sources.list.d/drake.list >/dev/null
+
+RUN apt-get update && apt-get install -y --no-install-recommends drake-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /drake_ros_ws
+RUN mkdir -p src
+
+RUN git clone https://github.com/RobotLocomotion/drake-ros.git src/drake-ros
+
+RUN apt-get update && \
+    rosdep install --from-paths src --ignore-src -r -y && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/drake/bin${PATH:+:${PATH}}"
+ENV PYTHONPATH="/opt/drake/lib/python$(python3 -c 'import sys; print("{0}.{1}".format(*sys.version_info))')/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
+
+RUN /bin/bash -lc "\
+  source /opt/ros/${ROS_DISTRO}/setup.bash && \
+  rosdep install --from-paths src --ignore-src -r -y && \
+  colcon build --packages-select drake_ros drake_ros_examples --symlink-install \
+    --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_FLAGS='-Wno-error=maybe-uninitialized -Wno-maybe-uninitialized' && \
+  source install/setup.bash \
+"
 # Set default shell to bash
 SHELL ["/bin/bash", "-c"]
 
 # Set up environment variables
-ENV CMAKE_PREFIX_PATH="/opt/ros/${ROS_DISTRO}:${CMAKE_PREFIX_PATH}"
+ENV CMAKE_PREFIX_PATH="/opt/ros/${ROS_DISTRO}:/drake_ros_ws/install:${CMAKE_PREFIX_PATH}"
 ENV DISPLAY=${DISPLAY} QT_X11_NO_MITSHM=1
 
 # Set up user and workspace

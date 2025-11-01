@@ -17,8 +17,24 @@ ccache
 python3-pygame
 python3-tk
 black
+gfortran 
+libclang-19-dev 
+libgl-dev 
+libglib2.0-dev 
+libglx-dev 
+liblapack-dev 
+libopengl-dev 
+ocl-icd-opencl-dev 
+opencl-headers 
+patch 
+pkg-config 
+python3-all-dev 
+zlib1g-dev 
+python3-rosdep
+python3-colcon-common-extensions
 
-ros-${ROS_DISTRO}-ament-cmake-clang-format
+ros-${ROS_DISTRO}-ament-cmake-ros
+ros-${ROS_DISTRO}-ament-clang-format
 ros-${ROS_DISTRO}-joint-state-publisher-gui
 ros-${ROS_DISTRO}-xacro
 ros-${ROS_DISTRO}-mcap-vendor
