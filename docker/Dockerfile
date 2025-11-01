@@ -36,26 +36,33 @@ RUN echo "deb [arch=amd64] https://drake-apt.csail.mit.edu/$(lsb_release -cs) $(
 
 RUN apt-get update && apt-get install -y --no-install-recommends drake-dev && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /drake_ros_ws
-RUN mkdir -p src
-
-RUN git clone https://github.com/RobotLocomotion/drake-ros.git src/drake-ros
-
-RUN apt-get update && \
-    rosdep install --from-paths src --ignore-src -r -y && \
-    rm -rf /var/lib/apt/lists/*
-
 ENV PATH="/opt/drake/bin${PATH:+:${PATH}}"
 ENV PYTHONPATH="/opt/drake/lib/python$(python3 -c 'import sys; print("{0}.{1}".format(*sys.version_info))')/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 
-RUN /bin/bash -lc "\
+# Clone drake-ros and install prerequisites using their script
+WORKDIR /tmp
+RUN git clone https://github.com/RobotLocomotion/drake-ros.git /tmp/drake-ros
+
+# Use drake-ros install script to install dependencies (following the https://github.com/RobotLocomotion/drake-ros/blob/main/.devcontainer/Dockerfile)
+RUN yes | /tmp/drake-ros/setup/install_prereqs \
+    -C /tmp/throwaway --with-colcon && \
+    rm -rf /tmp/throwaway /var/lib/apt/lists/*
+
+# Set up drake-ros workspace
+WORKDIR /drake_ros_ws
+RUN mkdir -p src
+RUN mv /tmp/drake-ros src/drake-ros
+
+# Build drake_ros packages
+RUN /bin/bash -c "\
   source /opt/ros/${ROS_DISTRO}/setup.bash && \
+  rosdep update && \
   rosdep install --from-paths src --ignore-src -r -y && \
   colcon build --packages-select drake_ros drake_ros_examples --symlink-install \
     --cmake-args \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CXX_FLAGS='-Wno-error=maybe-uninitialized -Wno-maybe-uninitialized' && \
-  source install/setup.bash \
+       source install/setup.bash \
 "
 # Set default shell to bash
 SHELL ["/bin/bash", "-c"]
