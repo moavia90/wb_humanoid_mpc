@@ -29,10 +29,10 @@ def generate_launch_description():
 
     # Add nodes
     cfg.ld.add_action(cfg.mpc_sim)
-    cfg.ld.add_action(cfg.robot_state_publisher_node)
-    cfg.ld.add_action(cfg.terminal_robot_state_publisher_node)
-    cfg.ld.add_action(cfg.target_robot_state_publisher_node)
-    cfg.ld.add_action(cfg.rviz_node)
+    # cfg.ld.add_action(cfg.robot_state_publisher_node)
+    # cfg.ld.add_action(cfg.terminal_robot_state_publisher_node)
+    # cfg.ld.add_action(cfg.target_robot_state_publisher_node)
+    # cfg.ld.add_action(cfg.rviz_node)
     cfg.ld.add_action(cfg.base_velocity_controller_gui_node)
 
     return cfg.ld

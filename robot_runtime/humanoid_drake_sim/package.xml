@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>humanoid_drake_sim</name>
+  <version>0.0.1</version>
+  <description>High-fidelity Drake simulation interface for humanoid MPC frameworks using OCS2. Provides Sim-to-Real verification capabilities for Centroidal and Whole-Body controllers.</description>
+  <maintainer email="developer@robotics.org">Robotics Developer</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+
+  <depend>tracetools</depend>
+
+  <depend>drake_ros</depend>
+
+  <depend>ocs2_core</depend>
+  <depend>ocs2_ros2_interfaces</depend>
+  <depend>ocs2_mpc</depend>
+  <depend>ocs2_pinocchio_interface</depend>
+  <depend>ocs2_centroidal_model</depend>
+  <depend>humanoid_common_mpc_ros2</depend>
+  <depend>humanoid_common_mpc</depend>
+  <depend>humanoid_centroidal_mpc</depend>
+  <depend>humanoid_mpc_msgs</depend>
+  <depend>ocs2_sqp</depend>
+  <depend>robot_model</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

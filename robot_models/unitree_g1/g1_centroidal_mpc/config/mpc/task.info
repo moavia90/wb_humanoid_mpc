@@ -79,7 +79,7 @@ swing_trajectory_config
 ; multiple_shooting settings
 multiple_shooting
 {
-  nThreads                              4
+  nThreads                              2
   dt                                    0.02
   sqpIteration                          1
   deltaTol                              1e-4
@@ -115,7 +115,7 @@ mpc
 
   debugPrint                      false
 
-  mpcDesiredFrequency             80  ; [Hz]
+  mpcDesiredFrequency             40  ; [Hz]
   mrtDesiredFrequency             100 ; [Hz]
 }
 
