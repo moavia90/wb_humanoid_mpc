@@ -138,12 +138,25 @@ ament_target_dependencies(drake_mrt_sim_node
   humanoid_centroidal_mpc
 )
 
+# ── Node 4: SAP PD Standing Test (no MPC, no OCS2) ───────────────────────────
+
+add_executable(drake_sap_stand_test src/drake_sap_stand_test.cpp)
+
+target_link_libraries(drake_sap_stand_test
+  drake::drake
+)
+
+ament_target_dependencies(drake_sap_stand_test
+  ament_index_cpp
+)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 
 install(TARGETS
   drake_sim_node
   policy_to_command_node
   drake_mrt_sim_node
+  drake_sap_stand_test
   DESTINATION lib/${PROJECT_NAME}
 )
 

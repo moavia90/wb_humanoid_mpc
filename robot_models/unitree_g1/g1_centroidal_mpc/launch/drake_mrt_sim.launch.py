@@ -116,6 +116,21 @@ def generate_launch_description():
             "direct_mujoco_torque_mode": True,
 
             # ------------------------------------------------------------------
+            # Drake/SAP control ladder.
+            #
+            # "sap_pd_stand": verify Drake can hold G1 upright without MRT torque.
+            # "mrt_walk":     SAP PD hold, then fade SAP PD out while MRT torque
+            #                 ramps in for walking experiments.
+            # "mrt_direct":   old behavior: direct MRT torque after startup pin.
+            # ------------------------------------------------------------------
+            "control_mode": "sap_pd_stand",
+            "enable_sap_pd_controller": True,
+            "sap_pd_hold_duration_s": 2.0,
+            "sap_pd_blend_duration_s": 3.0,
+            "mrt_torque_scale": 1.0,
+            "max_torque_rate": 1200.0,
+
+            # ------------------------------------------------------------------
             # [6] Manual compensation for Drake-ignored MJCF contact/friction
             # fields. This is not exact MuJoCo behavior; it is a practical
             # approximation.
