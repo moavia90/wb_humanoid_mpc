@@ -1,1539 +1,845 @@
-/******************************************************************************
-drake_mrt_sim_node.cpp
-
-Drake + OCS2 MRT runtime for Unitree G1 centroidal MPC.
-
-This version intentionally copies the important stabilizing behaviors from the
-repo's MuJoCo simulation interface:
-
-  [1] Auto reset on fall, including zero torque and cooldown.
-  [2] Passive joint damping, equivalent to MuJoCo dof_damping = 10.
-  [3] Small physics timestep support: sim_dt = 0.0005.
-  [4] MuJoCo-equivalent contact flags: RobotState always sees both feet true.
-  [5] Direct MuJoCo-style torque application:
-        tau = JointAction::getTotalFeedbackTorque(q, qd)
-      with no PD/MRT blending.
-  [6] Manual compensation for Drake-ignored MJCF features:
-        - explicit torque clamps replacing ignored actuatorfrcrange
-        - explicit passive damping replacing/augmenting missing dof damping
-        - explicit ground contact material/friction properties
-        - debug logs for ignored/approximate contact behavior
-
-Important:
-  - The real Drake contact forces are still logged separately.
-  - The controller contact flags can be forced true to match MuJoCo behavior.
-  - startup_pin_duration_s is kept as a Drake warm-start safety mechanism.
-
-******************************************************************************/
-
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
-#include <limits>
+#include <cstdint>
 #include <memory>
-#include <optional>
-#include <sstream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
 
-#include <Eigen/Dense>
+// OCS2 ROS 2 interfaces
+#include <ocs2_core/misc/LoadData.h>
+#include <ocs2_ros2_interfaces/mrt/MRT_ROS_Interface.h>
+#include <ocs2_ros2_interfaces/common/RosMsgConversions.h>
+#include <ocs2_centroidal_model/AccessHelperFunctions.h>
+#include <ocs2_centroidal_model/CentroidalModelInfo.h>
+#include <ocs2_centroidal_model/ModelHelperFunctions.h>
+#include <ocs2_robotic_tools/common/RotationDerivativesTransforms.h>
+#include <ocs2_robotic_tools/common/RotationTransforms.h>
 
-#include <drake/geometry/meshcat.h>
-#include <drake/geometry/meshcat_visualizer.h>
-#include <drake/geometry/proximity_properties.h>
-#include <drake/geometry/rgba.h>
-#include <drake/geometry/scene_graph.h>
-#include <drake/geometry/shape_specification.h>
-#include <drake/math/rigid_transform.h>
-#include <drake/math/rotation_matrix.h>
-#include <drake/multibody/parsing/parser.h>
-#include <drake/multibody/plant/contact_results.h>
-#include <drake/multibody/plant/multibody_plant.h>
-#include <drake/multibody/tree/joint_actuator.h>
-#include <drake/multibody/tree/revolute_joint.h>
-#include <drake/systems/analysis/simulator.h>
-#include <drake/systems/framework/context.h>
-#include <drake/systems/framework/diagram_builder.h>
-
-#include <ocs2_sqp/SqpMpc.h>
-
+// Centroidal MPC and Pinocchio models
 #include <humanoid_centroidal_mpc/CentroidalMpcInterface.h>
 #include <humanoid_centroidal_mpc/command/CentroidalMpcTargetTrajectoriesCalculator.h>
-#include <humanoid_centroidal_mpc/mrt/CentroidalMpcMrtJointController.h>
-#include <humanoid_common_mpc_ros2/ros_comm/Ros2ProceduralMpcMotionManager.h>
+#include <humanoid_common_mpc/gait/MotionPhaseDefinition.h>
+#include <humanoid_common_mpc/pinocchio_model/DynamicsHelperFunctions.h>
 #include <humanoid_common_mpc_ros2/visualization/HumanoidVisualizer.h>
+#include <humanoid_mpc_msgs/msg/walking_velocity_command.hpp>
 
+// Drake simulation interface and robot model
+#include <humanoid_drake_sim/DrakeSimInterface.h>
 #include <robot_model/RobotDescription.h>
-#include <robot_model/RobotJointAction.h>
 #include <robot_model/RobotState.h>
-
-namespace drake_mbd = drake::multibody;
-namespace drake_geo = drake::geometry;
-namespace drake_math = drake::math;
-namespace drake_sys = drake::systems;
+#include <robot_model/RobotJointAction.h>
 
 using namespace ocs2;
 using namespace ocs2::humanoid;
 
 namespace {
 
-constexpr double kPi = 3.141592653589793238462643383279502884;
+robot::model::RobotState makeInitialState(
+    const std::string& urdfFile, CentroidalMpcInterface& interface) {
+  robot::model::RobotDescription description(urdfFile);
+  robot::model::RobotState state(description, 2);
+  state.setConfigurationToZero();
 
-/* -------------------------------------------------------------------------- */
-/* Runtime config                                                              */
-/* -------------------------------------------------------------------------- */
+  const vector_t& initialMpcState = interface.getInitialState();
+  const auto& mpcModel = interface.getMpcRobotModel();
+  vector3_t basePosition = mpcModel.getBasePosition(initialMpcState);
+  // Calibrate initial floating base spawn height to ensure foot contact at z=0.0 m
+  // with static equilibrium normal forces supporting robot mass (z_spawn = 0.791068 m).
+  // In task.info nominal posture (-0.05, 0.10, -0.05), foot bottom is at +0.001432 m.
+  constexpr double kStanceHeightGroundingOffset = 0.001432;
+  basePosition.z() -= kStanceHeightGroundingOffset;
+  state.setRootPositionInWorldFrame(basePosition);
 
-struct DrakeMrtConfig {
-  std::string drake_model_path;
+  const vector_t jointAngles = mpcModel.getJointAngles(initialMpcState);
+  const auto jointIndices = description.getJointIndices(
+      interface.modelSettings().mpcModelJointNames);
+  if (jointIndices.size() != static_cast<size_t>(jointAngles.size())) {
+    throw std::runtime_error(
+        "Initial MPC joint vector does not match configured joint names");
+  }
+  for (size_t i = 0; i < jointIndices.size(); ++i) {
+    state.setJointPosition(jointIndices[i],
+                           jointAngles[static_cast<Eigen::Index>(i)]);
+  }
+  return state;
+}
 
-  // [3] MuJoCo-like small physics step.
-  double sim_dt{0.0005};
+struct ContinuousYawUnwrapper {
+  bool initialized = false;
+  double continuousYaw = 0.0;
 
-  // Controller loop rate. The node will run multiple Drake substeps per
-  // controller tick if control_period > sim_dt.
-  double control_rate_hz{250.0};
+  void reset() {
+    initialized = false;
+    continuousYaw = 0.0;
+  }
 
-  // Global hard clamp. Joint-specific limits below are also applied.
-  double max_torque{180.0};
-
-  // -1.0 means compute from foot pose. Positive value overrides.
-  double initial_height_override{-1.0};
-
-  // Drake-only warm start. Keep 2.0 at first; reduce later after stable.
-  double startup_pin_duration_s{2.0};
-
-  // [1] Reset/cooldown behavior, MuJoCo-style.
-  bool reset_on_fall{true};
-  double reset_cooldown_s{1.0};
-  double fall_z_threshold{0.25};
-  double fall_angle_threshold_rad{0.90};
-
-  // [2] MuJoCo dof_damping equivalent.
-  double passive_joint_damping{10.0};
-
-  // [4] MuJoCo-equivalent contact flags.
-  bool force_mujoco_contact_flags{true};
-
-  // [5] Direct torque mode. Keep true to match MuJoCo.
-  bool direct_mujoco_torque_mode{true};
-
-  // Drake/SAP control ladder:
-  //   sap_pd_stand: hold nominal posture with Drake's built-in SAP PD only.
-  //   mrt_walk:     hold with SAP PD, then fade SAP PD down while ramping MRT up.
-  //   mrt_direct:   old direct MRT torque behavior.
-  std::string control_mode{"sap_pd_stand"};
-  bool enable_sap_pd_controller{true};
-  double sap_pd_hold_duration_s{2.0};
-  double sap_pd_blend_duration_s{3.0};
-  double mrt_torque_scale{1.0};
-  double max_torque_rate{1200.0};
-
-  // [6] Manual Drake contact/material compensation.
-  double ground_static_friction{0.9};
-  double ground_dynamic_friction{0.7};
-  double ground_dissipation{2.0};
-  double ground_point_stiffness{5e4};
-  double ground_hydro_modulus{5e4};
-  double ground_hydro_margin{0.05};
-
-  std::string meshcat_host{"0.0.0.0"};
-
-  // Diagnostics.
-  double debug_publish_rate_hz{50.0};
-  double debug_log_period_s{0.25};
-  int debug_top_joints{8};
-  bool debug_verbose{true};
+  double unwrap(double rawYaw) {
+    if (!std::isfinite(rawYaw)) {
+      return continuousYaw;
+    }
+    if (!initialized) {
+      continuousYaw = rawYaw;
+      initialized = true;
+    } else {
+      continuousYaw += std::remainder(rawYaw - continuousYaw, 2.0 * M_PI);
+    }
+    return continuousYaw;
+  }
 };
 
-/* -------------------------------------------------------------------------- */
-/* Joint-specific defaults                                                     */
-/* -------------------------------------------------------------------------- */
+void updateMpcState(vector_t& mpcState,
+                    const robot::model::RobotState& robotState,
+                    const CentroidalMpcRobotModel<scalar_t>& mpcRobotModel,
+                    PinocchioInterface& pinocchioInterface,
+                    const std::vector<size_t>& mpcJointIndices,
+                    ContinuousYawUnwrapper& yawUnwrapper) {
+  const auto& info = mpcRobotModel.getCentroidalModelInfo();
+  vector3_t euler_zyx =
+      quaternionToEulerZYX(robotState.getRootRotationLocalToWorldFrame());
+  euler_zyx(0) = yawUnwrapper.unwrap(euler_zyx(0));
 
-double nominalQ(const std::string& joint_name) {
-  if (joint_name.find("hip_pitch") != std::string::npos) return -0.20;
-  if (joint_name.find("knee") != std::string::npos) return 0.40;
-  if (joint_name.find("ankle_pitch") != std::string::npos) return -0.20;
-  return 0.0;
+  vector_t qPinocchio(info.generalizedCoordinatesNum);
+  qPinocchio.head<3>() = robotState.getRootPositionInWorldFrame();
+  qPinocchio.segment<3>(3) = euler_zyx;
+  qPinocchio.tail(mpcRobotModel.getJointDim()) =
+      robotState.getJointPositions(mpcJointIndices);
+
+  vector_t vPinocchio(info.generalizedCoordinatesNum);
+  vPinocchio.head<3>() =
+      robotState.getRootRotationLocalToWorldFrame() *
+      robotState.getRootLinearVelocityInLocalFrame();
+  vPinocchio.segment<3>(3) =
+      getEulerAnglesZyxDerivativesFromLocalAngularVelocity<scalar_t>(
+          euler_zyx, robotState.getRootAngularVelocityInLocalFrame());
+  vPinocchio.tail(mpcRobotModel.getJointDim()) =
+      robotState.getJointVelocities(mpcJointIndices);
+
+  updateCentroidalDynamics(pinocchioInterface, info, qPinocchio);
+  const auto& A = getCentroidalMomentumMatrix(pinocchioInterface);
+
+  centroidal_model::getNormalizedMomentum(mpcState, info).noalias() =
+      A * vPinocchio / info.robotMass;
+  centroidal_model::getGeneralizedCoordinates(mpcState, info) = qPinocchio;
 }
 
-std::pair<double, double> sapPdGains(const std::string& joint_name) {
-  if (joint_name.find("hip_pitch") != std::string::npos) return {300.0, 10.0};
-  if (joint_name.find("hip_roll") != std::string::npos) return {200.0, 6.0};
-  if (joint_name.find("hip_yaw") != std::string::npos) return {100.0, 4.0};
-  if (joint_name.find("knee") != std::string::npos) return {400.0, 12.0};
-  if (joint_name.find("ankle_pitch") != std::string::npos) return {150.0, 6.0};
-  if (joint_name.find("ankle_roll") != std::string::npos) return {80.0, 3.0};
-  if (joint_name.find("waist") != std::string::npos) return {200.0, 5.0};
-  if (joint_name.find("shoulder") != std::string::npos) return {50.0, 2.0};
-  if (joint_name.find("elbow") != std::string::npos) return {50.0, 2.0};
-  if (joint_name.find("wrist") != std::string::npos) return {20.0, 1.0};
-  return {50.0, 2.0};
+void updateMpcObservation(SystemObservation& mpcObservation,
+                          const robot::model::RobotState& robotState,
+                          const CentroidalMpcRobotModel<scalar_t>& mpcRobotModel,
+                          PinocchioInterface& pinocchioInterface,
+                          const std::vector<size_t>& mpcJointIndices,
+                          ContinuousYawUnwrapper& yawUnwrapper,
+                          double mpcTimeOffset = 0.0) {
+  updateMpcState(mpcObservation.state, robotState, mpcRobotModel,
+                 pinocchioInterface, mpcJointIndices, yawUnwrapper);
+  mpcObservation.time = robotState.getTime() + mpcTimeOffset;
+  mpcObservation.input = vector_t::Zero(mpcRobotModel.getInputDim());
+  const std::vector<bool> configContacts = robotState.getContactFlags();
+  contact_flag_t contactFlags = {true, true};
+  if (configContacts.size() >= 2) {
+    contactFlags[0] = configContacts[0];
+    contactFlags[1] = configContacts[1];
+  }
+  mpcObservation.mode = stanceLeg2ModeNumber(contactFlags);
 }
 
-// These values compensate for Drake ignoring MJCF actuatorfrcrange /
-// actuatorfrclimited. They are conservative and can be tuned.
-double nominalTorqueLimit(const std::string& joint_name) {
-  if (joint_name.find("hip_") != std::string::npos) return 88.0;
-  if (joint_name.find("knee") != std::string::npos) return 139.0;
-  if (joint_name.find("ankle") != std::string::npos) return 50.0;
+// Root Cause 1 & B Fix: High-authority joint tracking stiffness for single-support stance,
+// swing-leg placement, and yaw turning without knee sag ("duck-walk") or leg crossing.
+double trackingKp(const std::string& jointName) {
+  if (jointName.find("hip_pitch")   != std::string::npos) return 400.0;
+  if (jointName.find("hip_roll")    != std::string::npos) return 350.0;
+  if (jointName.find("hip_yaw")     != std::string::npos) return 180.0;
+  if (jointName.find("knee")        != std::string::npos) return 450.0;
+  if (jointName.find("ankle_pitch") != std::string::npos) return 150.0;
+  if (jointName.find("ankle_roll")  != std::string::npos) return  80.0;
+  if (jointName.find("waist_pitch") != std::string::npos) return 200.0;
+  if (jointName.find("waist_roll")  != std::string::npos) return 200.0;
+  if (jointName.find("waist_yaw")   != std::string::npos) return 120.0;
+  if (jointName.find("shoulder")    != std::string::npos) return  40.0;
+  if (jointName.find("elbow")       != std::string::npos) return  30.0;
+  return 25.0;
+}
 
-  if (joint_name.find("waist_yaw") != std::string::npos) return 88.0;
-  if (joint_name.find("waist_roll") != std::string::npos) return 50.0;
-  if (joint_name.find("waist_pitch") != std::string::npos) return 50.0;
-
-  if (joint_name.find("shoulder") != std::string::npos) return 25.0;
-  if (joint_name.find("elbow") != std::string::npos) return 25.0;
-
-  if (joint_name.find("wrist_roll") != std::string::npos) return 25.0;
-  if (joint_name.find("wrist_pitch") != std::string::npos) return 5.0;
-  if (joint_name.find("wrist_yaw") != std::string::npos) return 5.0;
-
-  return 50.0;
+double trackingKd(const std::string& jointName) {
+  if (jointName.find("hip_pitch")   != std::string::npos) return 25.0;
+  if (jointName.find("hip_roll")    != std::string::npos) return 22.0;
+  if (jointName.find("hip_yaw")     != std::string::npos) return 10.0;
+  if (jointName.find("knee")        != std::string::npos) return 25.0;
+  if (jointName.find("ankle_pitch") != std::string::npos) return 10.0;
+  if (jointName.find("ankle_roll")  != std::string::npos) return  5.0;
+  if (jointName.find("waist_pitch") != std::string::npos) return 15.0;
+  if (jointName.find("waist_roll")  != std::string::npos) return 15.0;
+  if (jointName.find("waist_yaw")   != std::string::npos) return 10.0;
+  if (jointName.find("shoulder")    != std::string::npos) return  4.0;
+  if (jointName.find("elbow")       != std::string::npos) return  3.0;
+  return 2.0;
 }
 
 }  // namespace
 
-class DrakeRobotRuntimeAdapter {
- public:
-  DrakeRobotRuntimeAdapter(const std::shared_ptr<rclcpp::Node>& node,
-                           const robot::model::RobotDescription& robot_description,
-                           const robot::model::RobotState& desired_init_state,
-                           const DrakeMrtConfig& config)
-      : node_(node),
-        robot_description_(robot_description),
-        robot_state_(robot_description_, 2),
-        robot_joint_action_(robot_description_),
-        desired_init_state_(desired_init_state),
-        config_(config) {
-    buildDiagram();
-    setupPublishers();
-    setInitialStateFromDesiredState();
-
-    simulator_->Initialize();
-    diagram_->ForcedPublish(simulator_->get_context());
-
-    updateRobotStateFromDrake();
-
-    RCLCPP_INFO(node_->get_logger(),
-                "Drake MRT adapter ready | n_act=%d mass=%.2fkg spawn_z=%.3f "
-                "sim_dt=%.6f control_rate=%.1fHz direct_mujoco_torque=%d "
-                "passive_damping=%.2f force_mujoco_contacts=%d reset_on_fall=%d "
-                "control_mode=%s sap_pd=%d",
-                n_act_, total_mass_, spawn_height_, config_.sim_dt, config_.control_rate_hz, config_.direct_mujoco_torque_mode ? 1 : 0,
-                config_.passive_joint_damping, config_.force_mujoco_contact_flags ? 1 : 0, config_.reset_on_fall ? 1 : 0,
-                config_.control_mode.c_str(), config_.enable_sap_pd_controller ? 1 : 0);
-  }
-
-  const robot::model::RobotState& getRobotState() const { return robot_state_; }
-
-  robot::model::RobotJointAction& getRobotJointAction() { return robot_joint_action_; }
-
-  double getSimTime() const { return sim_time_; }
-
-  void markControllerReady() {
-    controller_ready_ = true;
-    pin_start_time_ = sim_time_;
-
-    RCLCPP_INFO(node_->get_logger(),
-                "Controller ready at sim_t=%.3f. startup_pin_duration_s=%.3f. "
-                "Keep 2.0 initially; reduce only after stable.",
-                sim_time_, config_.startup_pin_duration_s);
-  }
-
-  void stepOnce() {
-    auto& root_context = simulator_->get_mutable_context();
-    auto& plant_context = diagram_->GetMutableSubsystemContext(*plant_, &root_context);
-
-    const bool in_reset_cooldown = reset_cooldown_steps_remaining_ > 0;
-    const bool pin_active = startup_pinned_ || in_reset_cooldown;
-
-    if (pin_active) {
-      // Drake-only warm start/reset safety. MuJoCo does not pin, but this
-      // prevents collapse while MPC/MRT is not ready.
-      applyStartupPin(&plant_context);
-    }
-
-    const ControlBlend blend = computeControlBlend(in_reset_cooldown);
-    last_control_phase_ = blend.phase;
-    last_sap_pd_alpha_ = blend.sap_pd_alpha;
-    last_mrt_scale_ = blend.mrt_scale;
-
-    updateSapPdDesiredState(&plant_context, blend.sap_pd_alpha);
-
-    if (in_reset_cooldown) {
-      --reset_cooldown_steps_remaining_;
-      zeroActuation(&plant_context);
-    } else if (startup_pinned_ || blend.mrt_scale <= 0.0) {
-      // During pin/SAP hold, feedforward torques stay zero. SAP PD supplies the
-      // standing controller when enabled.
-      zeroActuation(&plant_context);
-    } else {
-      // [5] MuJoCo-style: apply controller's JointAction torque directly.
-      applyRobotJointActionToDrake(&plant_context, blend.mrt_scale);
-    }
-
-    sim_time_ += config_.sim_dt;
-
-    try {
-      simulator_->AdvanceTo(sim_time_);
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(node_->get_logger(), "Drake AdvanceTo failed at t=%.6f: %s. Resetting state.", sim_time_, e.what());
-      resetDrakeState("AdvanceTo exception");
-      return;
-    }
-
-    maybeReleaseStartupPin();
-
-    updateRobotStateFromDrake();
-    publishDebugTopics();
-    logDiagnostics();
-
-    if (config_.reset_on_fall && isFallen()) {
-      resetDrakeState("fall_detected");
-    }
-  }
-
- private:
-  struct ControlBlend {
-    std::string phase{"STARTUP_PIN"};
-    double sap_pd_alpha{0.0};
-    double mrt_scale{0.0};
-  };
-
-  struct ContactDebugInfo {
-    bool real_left{false};
-    bool real_right{false};
-
-    bool controller_left{true};
-    bool controller_right{true};
-
-    int point_pair_contacts{0};
-    int hydroelastic_contacts{0};
-
-    double left_fz{0.0};
-    double right_fz{0.0};
-
-    double left_ankle_z{std::numeric_limits<double>::quiet_NaN()};
-    double right_ankle_z{std::numeric_limits<double>::quiet_NaN()};
-
-    std::string controller_source{"mujoco_forced_true"};
-  };
-
-  /* ------------------------------------------------------------------------ */
-  /* Diagram/model setup                                                       */
-  /* ------------------------------------------------------------------------ */
-
-  void buildDiagram() {
-    drake_sys::DiagramBuilder<double> builder;
-
-    auto pair = drake_mbd::AddMultibodyPlantSceneGraph(&builder, config_.sim_dt);
-    plant_ = &pair.plant;
-    scene_graph_ = &pair.scene_graph;
-
-    // Manual compensation for Drake/MJCF differences:
-    // Drake ignores some MuJoCo contact fields such as torsional and rolling
-    // friction. We set explicit contact material here, but this is still only
-    // an approximation, not exact MuJoCo physics.
-    // kPointContactOnly: consistent, predictable contact for all geoms.
-    // kHydroelasticWithFallback caused mesh body geoms (torso, pelvis, legs)
-    // to fall through incorrect hydroelastic fallback paths, producing
-    // catastrophic contact forces. kPointContactOnly uses the same SAP path
-    // for all geometries regardless of whether they have proximity properties.
-    plant_->set_contact_model(drake_mbd::ContactModel::kPointContactOnly);
-    plant_->set_discrete_contact_approximation(drake_mbd::DiscreteContactApproximation::kSap);
-
-    drake_mbd::Parser parser(plant_);
-    parser.package_map().PopulateFromEnvironment("AMENT_PREFIX_PATH");
-
-    try {
-      const std::string share = ament_index_cpp::get_package_share_directory("g1_description");
-      if (!parser.package_map().Contains("g1_description")) {
-        parser.package_map().Add("g1_description", share);
-      }
-      RCLCPP_INFO(node_->get_logger(), "g1_description package path: %s", share.c_str());
-    } catch (const std::exception& e) {
-      RCLCPP_WARN(node_->get_logger(), "Could not add g1_description package path: %s", e.what());
-    }
-
-    RCLCPP_INFO(node_->get_logger(), "Loading Drake model: %s", config_.drake_model_path.c_str());
-
-    model_instance_ = parser.AddModels(config_.drake_model_path).at(0);
-
-    addGround();
-
-    configureSapPdController();
-
-    plant_->Finalize();
-
-    n_act_ = plant_->num_actuators();
-    if (n_act_ <= 0) {
-      throw std::runtime_error("Drake plant has zero actuators.");
-    }
-
-    actuation_cmd_ = Eigen::VectorXd::Zero(n_act_);
-    raw_controller_tau_ = Eigen::VectorXd::Zero(n_act_);
-    damping_tau_ = Eigen::VectorXd::Zero(n_act_);
-    unclamped_tau_ = Eigen::VectorXd::Zero(n_act_);
-    previous_actuation_cmd_ = Eigen::VectorXd::Zero(n_act_);
-
-    actuator_names_.reserve(static_cast<std::size_t>(n_act_));
-    for (drake_mbd::JointActuatorIndex i(0); i < n_act_; ++i) {
-      actuator_names_.push_back(plant_->get_joint_actuator(i).joint().name());
-    }
-
-    RCLCPP_INFO(node_->get_logger(), "Drake plant actuators:");
-    for (int i = 0; i < n_act_; ++i) {
-      RCLCPP_INFO(node_->get_logger(), "  act[%02d] = %s", i, actuator_names_[static_cast<std::size_t>(i)].c_str());
-    }
-
-    setupMeshcat(builder);
-
-    diagram_ = builder.Build();
-    simulator_ = std::make_unique<drake_sys::Simulator<double>>(*diagram_);
-    simulator_->set_target_realtime_rate(0.0);
-
-    const auto& plant_context = diagram_->GetSubsystemContext(*plant_, simulator_->get_context());
-    total_mass_ = plant_->CalcTotalMass(plant_context);
-
-    RCLCPP_INFO(node_->get_logger(), "Drake Meshcat URL: %s", meshcat_->web_url().c_str());
-  }
-
-  void configureSapPdController() {
-    if (!config_.enable_sap_pd_controller) {
-      return;
-    }
-
-    const int num_actuators = plant_->num_actuators();
-    RCLCPP_INFO(node_->get_logger(), "Enabling Drake SAP PD controller gains on %d actuators.", num_actuators);
-
-    for (drake_mbd::JointActuatorIndex i(0); i < num_actuators; ++i) {
-      auto& actuator = plant_->get_mutable_joint_actuator(i);
-      const auto [kp, kd] = sapPdGains(actuator.joint().name());
-      actuator.set_controller_gains({kp, kd});
-
-      if (config_.debug_verbose) {
-        RCLCPP_INFO(node_->get_logger(), "  sap_pd[%02d] %-35s Kp=%6.1f Kd=%5.1f", static_cast<int>(i), actuator.joint().name().c_str(), kp,
-                    kd);
-      }
-    }
-  }
-
-  void addGround() {
-    const double ground_size = 20.0;
-    const double ground_z = -0.1;
-
-    drake_geo::ProximityProperties props;
-
-    // [6] Approximation for ignored MuJoCo contact settings.
-    drake_geo::AddCompliantHydroelasticProperties(config_.ground_hydro_margin, config_.ground_hydro_modulus, &props);
-
-    drake_geo::AddContactMaterial(config_.ground_dissipation, config_.ground_point_stiffness,
-                                  drake_mbd::CoulombFriction<double>(config_.ground_static_friction, config_.ground_dynamic_friction),
-                                  &props);
-
-    plant_->RegisterCollisionGeometry(plant_->world_body(), drake_math::RigidTransformd(Eigen::Vector3d(0.0, 0.0, ground_z)),
-                                      drake_geo::Box(ground_size, ground_size, 0.2), "ground_collision", props);
-
-    plant_->RegisterVisualGeometry(plant_->world_body(), drake_math::RigidTransformd(Eigen::Vector3d(0.0, 0.0, ground_z - 0.1)),
-                                   drake_geo::Box(ground_size, ground_size, 0.2), "ground_visual", Eigen::Vector4d(0.50, 0.50, 0.50, 1.0));
-
-    RCLCPP_INFO(node_->get_logger(),
-                "Ground contact material | mu_static=%.2f mu_dynamic=%.2f "
-                "dissipation=%.2f point_stiffness=%.1e hydro_modulus=%.1e",
-                config_.ground_static_friction, config_.ground_dynamic_friction, config_.ground_dissipation, config_.ground_point_stiffness,
-                config_.ground_hydro_modulus);
-  }
-
-  void setupMeshcat(drake_sys::DiagramBuilder<double>& builder) {
-    drake::geometry::MeshcatParams meshcat_params;
-    meshcat_params.host = config_.meshcat_host;
-
-    meshcat_ = std::make_shared<drake::geometry::Meshcat>(meshcat_params);
-
-    meshcat_->SetObject("/debug/red_box", drake_geo::Box(0.2, 0.2, 0.2), drake_geo::Rgba(1.0, 0.0, 0.0, 1.0));
-    meshcat_->SetTransform("/debug/red_box", drake_math::RigidTransformd(Eigen::Vector3d(0.0, 0.0, 1.0)));
-
-    meshcat_->SetCameraPose(Eigen::Vector3d(2.5, -1.5, 1.4), Eigen::Vector3d(0.0, 0.0, 0.8));
-
-    drake_geo::MeshcatVisualizerParams viz_params;
-    viz_params.publish_period = 1.0 / 60.0;
-
-    drake_geo::MeshcatVisualizer<double>::AddToBuilder(&builder, *scene_graph_, meshcat_, viz_params);
-  }
-
-  void setupPublishers() {
-    joint_state_pub_ = node_->create_publisher<sensor_msgs::msg::JointState>("/drake/joint_states", 10);
-    joint_states_rviz_pub_ = node_->create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
-
-    centroidal_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>("/drake/centroidal_state", 10);
-    sim_time_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>("/drake/sim_time", 10);
-    contact_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>("/drake/foot_contacts", 10);
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Initial state / reset                                                     */
-  /* ------------------------------------------------------------------------ */
-
-  void setInitialStateFromDesiredState() {
-    auto& root_context = simulator_->get_mutable_context();
-    auto& plant_context = diagram_->GetMutableSubsystemContext(*plant_, &root_context);
-
-    applyDesiredStateToPlant(&plant_context, true);
-    updateSapPdDesiredState(&plant_context, 1.0);
-
-    RCLCPP_INFO(node_->get_logger(), "Initial state set | spawn_z=%.4f initial_height_override=%.4f", spawn_height_,
-                config_.initial_height_override);
-  }
-
-  void applyDesiredStateToPlant(drake_sys::Context<double>* plant_context, bool recompute_spawn_height) {
-    const auto& pelvis = plant_->GetBodyByName("pelvis");
-
-    drake_mbd::SpatialVelocity<double> zero_twist;
-    zero_twist.SetZero();
-
-    double target_z = spawn_height_;
-
-    if (recompute_spawn_height) {
-      const double reference_height = 1.0;
-
-      plant_->SetFreeBodyPose(
-          plant_context, pelvis,
-          drake_math::RigidTransformd(drake_math::RotationMatrixd::Identity(), Eigen::Vector3d(0.0, 0.0, reference_height)));
-
-      plant_->SetFreeBodySpatialVelocity(plant_context, pelvis, zero_twist);
-
-      plant_->get_actuation_input_port(model_instance_).FixValue(plant_context, Eigen::VectorXd::Zero(n_act_));
-
-      for (const auto& joint_name : actuator_names_) {
-        setJointToInitialValue(plant_context, joint_name);
-      }
-
-      double lowest_foot_z = reference_height;
-      for (const auto& ankle_name : {std::string("left_ankle_roll_link"), std::string("right_ankle_roll_link")}) {
-        try {
-          const auto& ankle_body = plant_->GetBodyByName(ankle_name);
-          const auto ankle_pose = plant_->EvalBodyPoseInWorld(*plant_context, ankle_body);
-          lowest_foot_z = std::min(lowest_foot_z, ankle_pose.translation().z() - 0.03);
-        } catch (...) {
-        }
-      }
-
-      constexpr double kFootClearance = 0.005;
-      const double foot_offset = reference_height - lowest_foot_z;
-      target_z = foot_offset + kFootClearance;
-
-      if (config_.initial_height_override > 0.0) {
-        RCLCPP_WARN(node_->get_logger(), "Manual initial_height override %.4f m; auto was %.4f m.", config_.initial_height_override,
-                    target_z);
-        target_z = config_.initial_height_override;
-      }
-
-      spawn_height_ = target_z;
-      desired_root_position_ = Eigen::Vector3d(0.0, 0.0, spawn_height_);
-    }
-
-    plant_->SetFreeBodyPose(plant_context, pelvis,
-                            drake_math::RigidTransformd(drake_math::RotationMatrixd::Identity(), Eigen::Vector3d(0.0, 0.0, target_z)));
-
-    plant_->SetFreeBodySpatialVelocity(plant_context, pelvis, zero_twist);
-
-    for (const auto& joint_name : actuator_names_) {
-      setJointToInitialValue(plant_context, joint_name);
-    }
-  }
-
-  void setJointToInitialValue(drake_sys::Context<double>* plant_context, const std::string& joint_name) {
-    try {
-      const auto& joint = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(plant_->GetJointByName(joint_name));
-
-      joint.set_angle(plant_context, initialJointPosition(joint_name));
-      joint.set_angular_rate(plant_context, 0.0);
-    } catch (...) {
-    }
-  }
-
-  double initialJointPosition(const std::string& joint_name) const {
-    double q0 = nominalQ(joint_name);
-
-    if (robot_description_.containsJoint(joint_name)) {
-      q0 = desired_init_state_.getJointPosition(robot_description_.getJointIndex(joint_name));
-    }
-
-    return q0;
-  }
-
-  void updateSapPdDesiredState(drake_sys::Context<double>* plant_context, double alpha) {
-    if (!sapPdAvailable()) {
-      return;
-    }
-
-    alpha = std::clamp(alpha, 0.0, 1.0);
-
-    if (sap_desired_state_.size() != 2 * n_act_) {
-      sap_desired_state_ = Eigen::VectorXd::Zero(2 * n_act_);
-    }
-
-    for (int ai = 0; ai < n_act_; ++ai) {
-      const std::string& joint_name = actuator_names_[static_cast<std::size_t>(ai)];
-
-      double q_meas = initialJointPosition(joint_name);
-      double qd_meas = 0.0;
-
-      try {
-        const auto& joint = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(plant_->GetJointByName(joint_name));
-        q_meas = joint.get_angle(*plant_context);
-        qd_meas = joint.get_angular_rate(*plant_context);
-      } catch (...) {
-      }
-
-      const double q_nom = initialJointPosition(joint_name);
-      sap_desired_state_[ai] = q_meas + alpha * (q_nom - q_meas);
-      sap_desired_state_[n_act_ + ai] = qd_meas + alpha * (0.0 - qd_meas);
-    }
-
-    plant_->get_desired_state_input_port(model_instance_).FixValue(plant_context, sap_desired_state_);
-  }
-
-  void applyStartupPin(drake_sys::Context<double>* plant_context) {
-    // Drake-only safety. It overwrites floating-base and joint state so the
-    // controller can initialize without the robot falling.
-    applyDesiredStateToPlant(plant_context, false);
-  }
-
-  void maybeReleaseStartupPin() {
-    if (!startup_pinned_) {
-      return;
-    }
-
-    if (!controller_ready_) {
-      return;
-    }
-
-    if (reset_cooldown_steps_remaining_ > 0) {
-      return;
-    }
-
-    if ((sim_time_ - pin_start_time_) >= config_.startup_pin_duration_s) {
-      startup_pinned_ = false;
-      unpinned_start_time_ = sim_time_;
-      RCLCPP_WARN(node_->get_logger(), "Startup pin released at sim_t=%.3f. control_mode=%s", sim_time_, config_.control_mode.c_str());
-    }
-  }
-
-  ControlBlend computeControlBlend(bool in_reset_cooldown) const {
-    if (in_reset_cooldown) {
-      return {"RESET_COOLDOWN", sapPdAvailable() ? 1.0 : 0.0, 0.0};
-    }
-
-    if (startup_pinned_) {
-      return {"STARTUP_PIN", sapPdAvailable() ? 1.0 : 0.0, 0.0};
-    }
-
-    if (config_.control_mode == "sap_pd_stand") {
-      return {"SAP_PD_STAND", sapPdAvailable() ? 1.0 : 0.0, 0.0};
-    }
-
-    const double elapsed = std::max(0.0, sim_time_ - unpinned_start_time_);
-
-    if (config_.control_mode == "mrt_direct" || !sapPdAvailable()) {
-      const double ramp = rampFraction(elapsed, config_.sap_pd_blend_duration_s);
-      return {"MRT_DIRECT", 0.0, config_.mrt_torque_scale * ramp};
-    }
-
-    if (config_.control_mode != "mrt_walk") {
-      return {"SAP_PD_STAND", 1.0, 0.0};
-    }
-
-    if (elapsed < config_.sap_pd_hold_duration_s) {
-      return {"SAP_PD_HOLD", 1.0, 0.0};
-    }
-
-    const double blend_elapsed = elapsed - config_.sap_pd_hold_duration_s;
-    const double ramp = rampFraction(blend_elapsed, config_.sap_pd_blend_duration_s);
-    const double sap_alpha = 1.0 - ramp;
-    const double mrt_scale = config_.mrt_torque_scale * ramp;
-
-    if (ramp < 1.0) {
-      return {"SAP_PD_MRT_RAMP", sap_alpha, mrt_scale};
-    }
-
-    return {"MRT_WALK", 0.0, config_.mrt_torque_scale};
-  }
-
-  bool sapPdAvailable() const { return config_.enable_sap_pd_controller; }
-
-  static double rampFraction(double elapsed, double duration) {
-    if (duration <= 0.0) {
-      return 1.0;
-    }
-    return std::clamp(elapsed / duration, 0.0, 1.0);
-  }
-
-  void resetDrakeState(const std::string& reason) {
-    auto& root_context = simulator_->get_mutable_context();
-    auto& plant_context = diagram_->GetMutableSubsystemContext(*plant_, &root_context);
-
-    ++reset_count_;
-
-    RCLCPP_ERROR(node_->get_logger(),
-                 "[drake_reset] reason=%s count=%d sim_t=%.3f. "
-                 "Resetting base, joints, velocities, torques, and entering cooldown %.2fs.",
-                 reason.c_str(), reset_count_, sim_time_, config_.reset_cooldown_s);
-
-    applyDesiredStateToPlant(&plant_context, false);
-    updateSapPdDesiredState(&plant_context, 1.0);
-    zeroActuation(&plant_context);
-
-    startup_pinned_ = true;
-    pin_start_time_ = sim_time_;
-
-    reset_cooldown_steps_remaining_ = std::max(1, static_cast<int>(std::round(config_.reset_cooldown_s / config_.sim_dt)));
-
-    try {
-      simulator_->Initialize();
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(node_->get_logger(), "simulator_->Initialize() after reset failed: %s", e.what());
-    }
-
-    updateRobotStateFromDrake();
-  }
-
-  bool isFallen() const {
-    const auto& context = simulator_->get_context();
-    const auto& plant_context = diagram_->GetSubsystemContext(*plant_, context);
-
-    try {
-      const auto& pelvis = plant_->GetBodyByName("pelvis");
-      const auto X = plant_->EvalBodyPoseInWorld(plant_context, pelvis);
-      const auto R = X.rotation().matrix();
-
-      const double pitch = std::asin(std::clamp(-R(2, 0), -1.0, 1.0));
-      const double roll = std::atan2(R(2, 1), R(2, 2));
-
-      return X.translation().z() < config_.fall_z_threshold || std::abs(roll) > config_.fall_angle_threshold_rad ||
-             std::abs(pitch) > config_.fall_angle_threshold_rad;
-    } catch (...) {
-      return false;
-    }
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* State mapping                                                             */
-  /* ------------------------------------------------------------------------ */
-
-  void updateRobotStateFromDrake() {
-    const auto& root_context = simulator_->get_context();
-    const auto& plant_context = diagram_->GetSubsystemContext(*plant_, root_context);
-    const auto& pelvis = plant_->GetBodyByName("pelvis");
-
-    const auto X_WB = plant_->EvalBodyPoseInWorld(plant_context, pelvis);
-    const auto V_WB = plant_->EvalBodySpatialVelocityInWorld(plant_context, pelvis);
-
-    robot::quaternion_t quat_l_to_w(X_WB.rotation().matrix());
-
-    robot_state_.setRootRotationLocalToWorldFrame(quat_l_to_w);
-    robot_state_.setRootPositionInWorldFrame(X_WB.translation());
-
-    robot_state_.setRootLinearVelocityInLocalFrame(quat_l_to_w.inverse() * V_WB.translational());
-
-    robot_state_.setRootAngularVelocityInLocalFrame(quat_l_to_w.inverse() * V_WB.rotational());
-
-    for (const auto& joint_name : robot_description_.getJointNames()) {
-      const auto joint_idx = robot_description_.getJointIndex(joint_name);
-
-      try {
-        const auto& joint = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(plant_->GetJointByName(joint_name));
-
-        robot_state_.setJointPosition(joint_idx, joint.get_angle(plant_context));
-        robot_state_.setJointVelocity(joint_idx, joint.get_angular_rate(plant_context));
-      } catch (...) {
-        robot_state_.setJointPosition(joint_idx, 0.0);
-        robot_state_.setJointVelocity(joint_idx, 0.0);
-      }
-    }
-
-    // [4] This matches MuJoCo code behavior: contact sensors are ignored and
-    // both feet are always true. Real Drake contact forces are still logged.
-    if (config_.force_mujoco_contact_flags) {
-      robot_state_.setContactFlag(0, true);
-      robot_state_.setContactFlag(1, true);
-    } else {
-      const auto contact = computeContactDebugInfo(plant_context);
-      robot_state_.setContactFlag(0, contact.real_left);
-      robot_state_.setContactFlag(1, contact.real_right);
-    }
-
-    robot_state_.setTime(sim_time_);
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Contact debug                                                             */
-  /* ------------------------------------------------------------------------ */
-
-  ContactDebugInfo computeContactDebugInfo(const drake_sys::Context<double>& plant_context) const {
-    ContactDebugInfo info;
-
-    try {
-      const auto& left_ankle = plant_->GetBodyByName("left_ankle_roll_link");
-      const auto& right_ankle = plant_->GetBodyByName("right_ankle_roll_link");
-
-      info.left_ankle_z = plant_->EvalBodyPoseInWorld(plant_context, left_ankle).translation().z();
-
-      info.right_ankle_z = plant_->EvalBodyPoseInWorld(plant_context, right_ankle).translation().z();
-    } catch (...) {
-    }
-
-    constexpr double kContactThresholdN = 10.0;
-
-    try {
-      const auto& contact_results = plant_->get_contact_results_output_port().Eval<drake_mbd::ContactResults<double>>(plant_context);
-
-      info.point_pair_contacts = contact_results.num_point_pair_contacts();
-      info.hydroelastic_contacts = contact_results.num_hydroelastic_contacts();
-
-      for (int c = 0; c < contact_results.num_point_pair_contacts(); ++c) {
-        const auto& contact = contact_results.point_pair_contact_info(c);
-        const auto& body_a = plant_->get_body(contact.bodyA_index());
-        const auto& body_b = plant_->get_body(contact.bodyB_index());
-
-        const auto is_left = [](const std::string& name) {
-          return name.find("left_ankle") != std::string::npos || name.find("left_foot") != std::string::npos;
-        };
-
-        const auto is_right = [](const std::string& name) {
-          return name.find("right_ankle") != std::string::npos || name.find("right_foot") != std::string::npos;
-        };
-
-        const double fz = std::abs(contact.contact_force().z());
-
-        if (is_left(body_a.name()) || is_left(body_b.name())) {
-          info.left_fz += fz;
-        }
-
-        if (is_right(body_a.name()) || is_right(body_b.name())) {
-          info.right_fz += fz;
-        }
-      }
-    } catch (...) {
-    }
-
-    info.real_left = info.left_fz > kContactThresholdN;
-    info.real_right = info.right_fz > kContactThresholdN;
-
-    if (config_.force_mujoco_contact_flags) {
-      info.controller_left = true;
-      info.controller_right = true;
-      info.controller_source = "mujoco_forced_true";
-    } else {
-      info.controller_left = info.real_left;
-      info.controller_right = info.real_right;
-      info.controller_source = "drake_contact_force";
-    }
-
-    return info;
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Actuation                                                                 */
-  /* ------------------------------------------------------------------------ */
-
-  void zeroActuation(drake_sys::Context<double>* plant_context) {
-    actuation_cmd_.setZero();
-    raw_controller_tau_.setZero();
-    damping_tau_.setZero();
-    unclamped_tau_.setZero();
-
-    torque_inf_ = 0.0;
-    raw_tau_inf_ = 0.0;
-    damping_tau_inf_ = 0.0;
-    missing_action_count_ = 0;
-    nonfinite_action_count_ = 0;
-    saturation_count_ = 0;
-    rate_limited_count_ = 0;
-    saturated_joint_summary_ = "none";
-    previous_actuation_cmd_.setZero();
-
-    plant_->get_actuation_input_port(model_instance_).FixValue(plant_context, actuation_cmd_);
-  }
-
-  void applyRobotJointActionToDrake(drake_sys::Context<double>* plant_context, double torque_scale) {
-    raw_controller_tau_.setZero();
-    damping_tau_.setZero();
-    unclamped_tau_.setZero();
-    actuation_cmd_.setZero();
-
-    missing_action_count_ = 0;
-    nonfinite_action_count_ = 0;
-    saturation_count_ = 0;
-    rate_limited_count_ = 0;
-    torque_scale = std::clamp(torque_scale, 0.0, 1.0);
-
-    // [5] Direct MuJoCo-style torque:
-    //   ctrl[i] = jointAction.getTotalFeedbackTorque(q, qd)
-    // This intentionally removes the earlier PD/MRT blend.
-    for (int ai = 0; ai < n_act_; ++ai) {
-      const std::string& joint_name = actuator_names_[static_cast<std::size_t>(ai)];
-
-      if (!robot_description_.containsJoint(joint_name)) {
-        continue;
-      }
-
-      const auto joint_idx = robot_description_.getJointIndex(joint_name);
-
-      double q_meas = 0.0;
-      double qd_meas = 0.0;
-
-      try {
-        const auto& joint = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(plant_->GetJointByName(joint_name));
-        q_meas = joint.get_angle(*plant_context);
-        qd_meas = joint.get_angular_rate(*plant_context);
-      } catch (...) {
-      }
-
-      double tau_controller = 0.0;
-
-      if (config_.direct_mujoco_torque_mode) {
-        const auto& action_opt = robot_joint_action_.at(joint_idx);
-
-        if (!action_opt.has_value()) {
-          ++missing_action_count_;
-          tau_controller = 0.0;
-        } else {
-          tau_controller = action_opt.value().getTotalFeedbackTorque(q_meas, qd_meas);
-        }
-
-        if (!std::isfinite(tau_controller)) {
-          ++nonfinite_action_count_;
-          tau_controller = 0.0;
-        }
-      }
-
-      // [2] Passive joint damping equivalent to MuJoCo dof_damping = 10.
-      const double tau_damping = -config_.passive_joint_damping * qd_meas;
-
-      raw_controller_tau_[ai] = tau_controller;
-      damping_tau_[ai] = tau_damping;
-      unclamped_tau_[ai] = torque_scale * tau_controller + tau_damping;
-    }
-
-    Eigen::VectorXd clamped = unclamped_tau_;
-
-    for (int ai = 0; ai < n_act_; ++ai) {
-      const std::string& joint_name = actuator_names_[static_cast<std::size_t>(ai)];
-
-      const double limit = std::min(config_.max_torque, nominalTorqueLimit(joint_name));
-
-      if (!std::isfinite(clamped[ai])) {
-        clamped[ai] = 0.0;
-      }
-
-      const double before = clamped[ai];
-      clamped[ai] = std::clamp(clamped[ai], -limit, limit);
-
-      if (std::abs(before - clamped[ai]) > 1e-9) {
-        ++saturation_count_;
-      }
-    }
-
-    if (config_.max_torque_rate > 0.0 && previous_actuation_cmd_.size() == clamped.size()) {
-      const double max_delta = config_.max_torque_rate * config_.sim_dt;
-
-      for (int ai = 0; ai < clamped.size(); ++ai) {
-        const double before = clamped[ai];
-        clamped[ai] = std::clamp(clamped[ai], previous_actuation_cmd_[ai] - max_delta, previous_actuation_cmd_[ai] + max_delta);
-
-        if (std::abs(before - clamped[ai]) > 1e-9) {
-          ++rate_limited_count_;
-        }
-      }
-    }
-
-    actuation_cmd_ = clamped;
-    previous_actuation_cmd_ = clamped;
-
-    raw_tau_inf_ = raw_controller_tau_.size() > 0 ? raw_controller_tau_.cwiseAbs().maxCoeff() : 0.0;
-    damping_tau_inf_ = damping_tau_.size() > 0 ? damping_tau_.cwiseAbs().maxCoeff() : 0.0;
-    torque_inf_ = actuation_cmd_.size() > 0 ? actuation_cmd_.cwiseAbs().maxCoeff() : 0.0;
-
-    saturated_joint_summary_ = saturatedJointsString(unclamped_tau_, actuation_cmd_, config_.debug_top_joints);
-
-    plant_->get_actuation_input_port(model_instance_).FixValue(plant_context, actuation_cmd_);
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Debug publishing/logging                                                  */
-  /* ------------------------------------------------------------------------ */
-
-  void publishDebugTopics() {
-    const int every_n = std::max(1, static_cast<int>(std::round(1.0 / (config_.sim_dt * config_.debug_publish_rate_hz))));
-
-    if ((publish_count_++ % every_n) != 0) {
-      return;
-    }
-
-    const auto& root_context = simulator_->get_context();
-    const auto& plant_context = diagram_->GetSubsystemContext(*plant_, root_context);
-
-    publishJointStates(plant_context);
-    publishContacts(plant_context);
-    publishCentroidalState(plant_context);
-    publishSimTime();
-
-    try {
-      diagram_->ForcedPublish(root_context);
-    } catch (...) {
-    }
-  }
-
-  void publishJointStates(const drake_sys::Context<double>& plant_context) {
-    sensor_msgs::msg::JointState js;
-    js.header.stamp = node_->now();
-    js.name = actuator_names_;
-    js.position.assign(static_cast<std::size_t>(n_act_), 0.0);
-    js.velocity.assign(static_cast<std::size_t>(n_act_), 0.0);
-    js.effort.assign(static_cast<std::size_t>(n_act_), 0.0);
-
-    for (int ai = 0; ai < n_act_; ++ai) {
-      try {
-        const auto& joint =
-            dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(plant_->GetJointByName(actuator_names_[static_cast<std::size_t>(ai)]));
-        js.position[static_cast<std::size_t>(ai)] = joint.get_angle(plant_context);
-        js.velocity[static_cast<std::size_t>(ai)] = joint.get_angular_rate(plant_context);
-        js.effort[static_cast<std::size_t>(ai)] = actuation_cmd_[ai];
-      } catch (...) {
-      }
-    }
-
-    joint_state_pub_->publish(js);
-    joint_states_rviz_pub_->publish(js);
-  }
-
-  void publishContacts(const drake_sys::Context<double>& plant_context) {
-    const auto contact = computeContactDebugInfo(plant_context);
-
-    // Layout:
-    // [controller_left, controller_right, real_left_fz, real_right_fz,
-    //  real_left_bool, real_right_bool, point_pair_count, hydro_count]
-    std_msgs::msg::Float64MultiArray ct;
-    ct.data = {
-        contact.controller_left ? 1.0 : 0.0,
-        contact.controller_right ? 1.0 : 0.0,
-        contact.left_fz,
-        contact.right_fz,
-        contact.real_left ? 1.0 : 0.0,
-        contact.real_right ? 1.0 : 0.0,
-        static_cast<double>(contact.point_pair_contacts),
-        static_cast<double>(contact.hydroelastic_contacts),
-    };
-
-    contact_pub_->publish(ct);
-  }
-
-  void publishCentroidalState(const drake_sys::Context<double>& plant_context) {
-    const auto& pelvis = plant_->GetBodyByName("pelvis");
-    const auto X = plant_->EvalBodyPoseInWorld(plant_context, pelvis);
-    const auto R = X.rotation().matrix();
-
-    const double yaw = std::atan2(R(1, 0), R(0, 0));
-    const double pitch = std::asin(std::clamp(-R(2, 0), -1.0, 1.0));
-    const double roll = std::atan2(R(2, 1), R(2, 2));
-
-    Eigen::Vector3d h_lin = Eigen::Vector3d::Zero();
-    Eigen::Vector3d h_ang = Eigen::Vector3d::Zero();
-
-    try {
-      h_lin = total_mass_ * plant_->CalcCenterOfMassTranslationalVelocityInWorld(plant_context);
-
-      const Eigen::Vector3d p_com = plant_->CalcCenterOfMassPositionInWorld(plant_context);
-      const auto L = plant_->CalcSpatialMomentumInWorldAboutPoint(plant_context, p_com);
-      h_ang = L.rotational();
-    } catch (...) {
-    }
-
-    auto safe = [](double v, double limit) { return (std::isfinite(v) && std::abs(v) < limit) ? v : 0.0; };
-
-    // Layout: [h_lin(3), h_ang(3), base_pos(3), yaw,pitch,roll]
-    std_msgs::msg::Float64MultiArray cs;
-    cs.data = {
-        safe(h_lin.x(), 2000.0),        safe(h_lin.y(), 2000.0), safe(h_lin.z(), 2000.0),         safe(h_ang.x(), 2000.0),
-        safe(h_ang.y(), 2000.0),        safe(h_ang.z(), 2000.0), safe(X.translation().x(), 50.0), safe(X.translation().y(), 50.0),
-        safe(X.translation().z(), 5.0), safe(yaw, kPi),          safe(pitch, kPi / 2.0),          safe(roll, kPi),
-    };
-
-    centroidal_pub_->publish(cs);
-  }
-
-  void publishSimTime() {
-    std_msgs::msg::Float64MultiArray st;
-    st.data = {sim_time_};
-    sim_time_pub_->publish(st);
-  }
-
-  std::string topAbsJointsString(const Eigen::VectorXd& v, int top_n) const {
-    std::vector<std::pair<double, int>> vals;
-    vals.reserve(static_cast<std::size_t>(v.size()));
-
-    for (int i = 0; i < v.size(); ++i) {
-      vals.emplace_back(std::abs(v[i]), i);
-    }
-
-    std::sort(vals.begin(), vals.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(1);
-
-    const int n = std::min(top_n, static_cast<int>(vals.size()));
-    for (int k = 0; k < n; ++k) {
-      const int idx = vals[static_cast<std::size_t>(k)].second;
-      ss << actuator_names_[static_cast<std::size_t>(idx)] << "=" << v[idx];
-
-      if (k + 1 < n) {
-        ss << ", ";
-      }
-    }
-
-    return ss.str();
-  }
-
-  std::string saturatedJointsString(const Eigen::VectorXd& unclamped, const Eigen::VectorXd& clamped, int top_n) const {
-    std::vector<std::pair<double, int>> vals;
-
-    for (int i = 0; i < unclamped.size(); ++i) {
-      const double diff = std::abs(unclamped[i] - clamped[i]);
-      if (diff > 1e-9) {
-        vals.emplace_back(diff, i);
-      }
-    }
-
-    std::sort(vals.begin(), vals.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(1);
-
-    const int n = std::min(top_n, static_cast<int>(vals.size()));
-    for (int k = 0; k < n; ++k) {
-      const int idx = vals[static_cast<std::size_t>(k)].second;
-
-      ss << actuator_names_[static_cast<std::size_t>(idx)] << ": raw=" << unclamped[idx] << " clamp=" << clamped[idx];
-
-      if (k + 1 < n) {
-        ss << ", ";
-      }
-    }
-
-    if (vals.empty()) {
-      ss << "none";
-    }
-
-    return ss.str();
-  }
-
-  void logDiagnostics() {
-    if (!config_.debug_verbose) {
-      return;
-    }
-
-    const int every_n = std::max(1, static_cast<int>(std::round(config_.debug_log_period_s / config_.sim_dt)));
-
-    if ((diag_count_++ % every_n) != 0) {
-      return;
-    }
-
-    const auto& root_context = simulator_->get_context();
-    const auto& plant_context = diagram_->GetSubsystemContext(*plant_, root_context);
-
-    const auto& pelvis = plant_->GetBodyByName("pelvis");
-    const auto X = plant_->EvalBodyPoseInWorld(plant_context, pelvis);
-    const auto V = plant_->EvalBodySpatialVelocityInWorld(plant_context, pelvis);
-
-    const auto R = X.rotation().matrix();
-
-    const double yaw = std::atan2(R(1, 0), R(0, 0));
-    const double pitch = std::asin(std::clamp(-R(2, 0), -1.0, 1.0));
-    const double roll = std::atan2(R(2, 1), R(2, 2));
-
-    Eigen::Vector3d com = Eigen::Vector3d::Zero();
-    Eigen::Vector3d com_v = Eigen::Vector3d::Zero();
-
-    try {
-      com = plant_->CalcCenterOfMassPositionInWorld(plant_context);
-      com_v = plant_->CalcCenterOfMassTranslationalVelocityInWorld(plant_context);
-    } catch (...) {
-    }
-
-    const auto contact = computeContactDebugInfo(plant_context);
-    const bool fallen_now = isFallen();
-
-    RCLCPP_INFO(node_->get_logger(),
-                "\n[drake_mrt_diag]\n"
-                "  t=%.3f phase=%s fallen=%d reset_count=%d pin=%d cooldown_steps=%d\n"
-                "  blend: mode=%s sap_pd_alpha=%.2f mrt_scale=%.2f max_torque_rate=%.1f\n"
-                "  base: pos=[%.3f %.3f %.3f] rpy=[%.3f %.3f %.3f] "
-                "linvel_norm=%.3f angvel_norm=%.3f\n"
-                "  com : pos=[%.3f %.3f %.3f] vel=[%.3f %.3f %.3f]\n"
-                "  contacts: controller=[%d %d] source=%s real=[%d %d] "
-                "fz=[%.1f %.1f] point_contacts=%d hydro_contacts=%d ankle_z=[%.3f %.3f]\n"
-                "  torque: final_inf=%.1f raw_controller_inf=%.1f damping_inf=%.1f "
-                "sat=%d rate_limited=%d missing_actions=%d nonfinite_actions=%d "
-                "passive_damping=%.2f\n"
-                "  top_final_tau     : %s\n"
-                "  top_raw_controller: %s\n"
-                "  top_damping_tau   : %s\n"
-                "  saturated         : %s",
-                sim_time_, last_control_phase_.c_str(), fallen_now ? 1 : 0, reset_count_, startup_pinned_ ? 1 : 0,
-                reset_cooldown_steps_remaining_, config_.control_mode.c_str(), last_sap_pd_alpha_, last_mrt_scale_, config_.max_torque_rate,
-
-                X.translation().x(), X.translation().y(), X.translation().z(), roll, pitch, yaw, V.translational().norm(),
-                V.rotational().norm(),
-
-                com.x(), com.y(), com.z(), com_v.x(), com_v.y(), com_v.z(),
-
-                contact.controller_left ? 1 : 0, contact.controller_right ? 1 : 0, contact.controller_source.c_str(),
-                contact.real_left ? 1 : 0, contact.real_right ? 1 : 0, contact.left_fz, contact.right_fz, contact.point_pair_contacts,
-                contact.hydroelastic_contacts, contact.left_ankle_z, contact.right_ankle_z,
-
-                torque_inf_, raw_tau_inf_, damping_tau_inf_, saturation_count_, rate_limited_count_, missing_action_count_,
-                nonfinite_action_count_, config_.passive_joint_damping,
-
-                topAbsJointsString(actuation_cmd_, config_.debug_top_joints).c_str(),
-                topAbsJointsString(raw_controller_tau_, config_.debug_top_joints).c_str(),
-                topAbsJointsString(damping_tau_, config_.debug_top_joints).c_str(), saturated_joint_summary_.c_str());
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Members                                                                   */
-  /* ------------------------------------------------------------------------ */
-
-  std::shared_ptr<rclcpp::Node> node_;
-  const robot::model::RobotDescription& robot_description_;
-
-  robot::model::RobotState robot_state_;
-  robot::model::RobotJointAction robot_joint_action_;
-  robot::model::RobotState desired_init_state_;
-
-  DrakeMrtConfig config_;
-
-  drake_mbd::MultibodyPlant<double>* plant_{nullptr};
-  drake_geo::SceneGraph<double>* scene_graph_{nullptr};
-  drake_mbd::ModelInstanceIndex model_instance_;
-
-  std::shared_ptr<drake_geo::Meshcat> meshcat_;
-  std::unique_ptr<drake_sys::Diagram<double>> diagram_;
-  std::unique_ptr<drake_sys::Simulator<double>> simulator_;
-
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_states_rviz_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr centroidal_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr sim_time_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr contact_pub_;
-
-  std::vector<std::string> actuator_names_;
-
-  Eigen::VectorXd actuation_cmd_;
-  Eigen::VectorXd raw_controller_tau_;
-  Eigen::VectorXd damping_tau_;
-  Eigen::VectorXd unclamped_tau_;
-  Eigen::VectorXd previous_actuation_cmd_;
-  Eigen::VectorXd sap_desired_state_;
-
-  Eigen::Vector3d desired_root_position_{0.0, 0.0, 0.8};
-
-  double total_mass_{35.0};
-  double spawn_height_{0.8};
-  double sim_time_{0.0};
-  double unpinned_start_time_{0.0};
-
-  bool controller_ready_{false};
-  bool startup_pinned_{true};
-
-  double pin_start_time_{0.0};
-
-  int reset_cooldown_steps_remaining_{0};
-  int reset_count_{0};
-
-  int n_act_{0};
-  int publish_count_{0};
-  int diag_count_{0};
-
-  double torque_inf_{0.0};
-  double raw_tau_inf_{0.0};
-  double damping_tau_inf_{0.0};
-
-  int saturation_count_{0};
-  int rate_limited_count_{0};
-  int missing_action_count_{0};
-  int nonfinite_action_count_{0};
-
-  double last_sap_pd_alpha_{0.0};
-  double last_mrt_scale_{0.0};
-
-  std::string last_control_phase_{"STARTUP_PIN"};
-  std::string saturated_joint_summary_{"none"};
-};
-
-/* ----------------------------------------------------------------------------
- * main()
- * -------------------------------------------------------------------------- */
-
 int main(int argc, char** argv) {
-  const std::vector<std::string> program_args = rclcpp::remove_ros_arguments(argc, argv);
-
-  if (program_args.size() < 7) {
+  const std::vector<std::string> programArgs =
+      rclcpp::remove_ros_arguments(argc, argv);
+  if (programArgs.size() < 6) {
     throw std::runtime_error(
-        "Expected args: robot_name task_file reference_file urdf_file "
-        "gait_file drake_model_file");
+        "Usage: drake_mrt_sim_node robot task.info reference.info "
+        "robot.urdf gait.info");
   }
 
-  const std::string robot_name = program_args[1];
-  const std::string task_file = program_args[2];
-  const std::string reference_file = program_args[3];
-  const std::string urdf_file = program_args[4];
-  const std::string gait_file = program_args[5];
-  const std::string drake_model_file = program_args[6];
+  const std::string robotName = programArgs[1];
+  const std::string taskFile = programArgs[2];
+  const std::string referenceFile = programArgs[3];
+  const std::string urdfFile = programArgs[4];
+  const std::string gaitFile = programArgs[5];
 
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<rclcpp::Node>(robot_name + "_drake_mrt_sim");
+  auto node = std::make_shared<rclcpp::Node>(robotName + "_drake_mrt_sim");
 
   node->declare_parameter<double>("sim_dt", 0.0005);
-  node->declare_parameter<double>("control_rate_hz", 250.0);
-  node->declare_parameter<double>("max_torque", 180.0);
-  node->declare_parameter<double>("initial_height", -1.0);
-
-  node->declare_parameter<double>("startup_pin_duration_s", 2.0);
-
-  node->declare_parameter<bool>("reset_on_fall", true);
-  node->declare_parameter<double>("reset_cooldown_s", 1.0);
-  node->declare_parameter<double>("fall_z_threshold", 0.25);
-  node->declare_parameter<double>("fall_angle_threshold_rad", 0.90);
-
-  node->declare_parameter<double>("passive_joint_damping", 10.0);
-  node->declare_parameter<bool>("force_mujoco_contact_flags", true);
-  node->declare_parameter<bool>("direct_mujoco_torque_mode", true);
-  node->declare_parameter<std::string>("control_mode", "sap_pd_stand");
-  node->declare_parameter<bool>("enable_sap_pd_controller", true);
-  node->declare_parameter<double>("sap_pd_hold_duration_s", 2.0);
-  node->declare_parameter<double>("sap_pd_blend_duration_s", 3.0);
-  node->declare_parameter<double>("mrt_torque_scale", 1.0);
-  node->declare_parameter<double>("max_torque_rate", 1200.0);
-
-  node->declare_parameter<double>("ground_static_friction", 0.9);
-  node->declare_parameter<double>("ground_dynamic_friction", 0.7);
+  node->declare_parameter<double>("control_rate_hz", 500.0);
+  node->declare_parameter<double>("joint_damping", 10.0);
+  node->declare_parameter<double>("ground_static_friction", 2.0);
+  node->declare_parameter<double>("ground_dynamic_friction", 1.5);
   node->declare_parameter<double>("ground_dissipation", 2.0);
-  node->declare_parameter<double>("ground_point_stiffness", 5e4);
-  node->declare_parameter<double>("ground_hydro_modulus", 5e4);
-  node->declare_parameter<double>("ground_hydro_margin", 0.05);
+  node->declare_parameter<double>("ground_point_stiffness", 5.0e4);
+  node->declare_parameter<bool>("force_mujoco_contact_flags", true);
+  node->declare_parameter<bool>("reset_on_fall", true);
+  node->declare_parameter<double>("fall_z_threshold", 0.2);
+  node->declare_parameter<double>("reset_cooldown_s", 1.0);
+  node->declare_parameter<double>("max_forward_vel_x", 0.65);
+  node->declare_parameter<double>("max_backward_vel_x", 0.48);
+  node->declare_parameter<double>("max_lateral_vel_y", 0.30);
+  node->declare_parameter<double>("max_yaw_rate_z", 0.32);
+  node->declare_parameter<double>("min_pelvis_height", 0.68);
+  node->declare_parameter<double>("max_pelvis_height", 0.84);
+  node->declare_parameter<bool>("enable_meshcat", true);
+  node->declare_parameter<std::string>("meshcat_host", "*");
+  node->declare_parameter<double>("meshcat_publish_rate_hz", 30.0);
+  node->declare_parameter<bool>("verbose", true);
 
-  node->declare_parameter<std::string>("meshcat_host", "0.0.0.0");
+  // Model & Pinocchio interfaces (setupOCP = false for MRT follower sim node)
+  CentroidalMpcInterface interface(taskFile, urdfFile, referenceFile, false);
+  auto pinocchioInterface = interface.getPinocchioInterface();
+  std::unique_ptr<CentroidalMpcRobotModel<scalar_t>> mpcModelPtr(interface.getMpcRobotModel().clone());
+  auto& mpcModel = *mpcModelPtr;
+  const auto& modelSettings = interface.modelSettings();
 
-  node->declare_parameter<double>("debug_publish_rate_hz", 50.0);
-  node->declare_parameter<double>("debug_log_period_s", 0.25);
-  node->declare_parameter<int>("debug_top_joints", 8);
-  node->declare_parameter<bool>("debug_verbose", true);
+  robot::drake_sim_interface::DrakeSimConfig simConfig;
+  auto initialState = std::make_shared<robot::model::RobotState>(
+      makeInitialState(urdfFile, interface));
+  simConfig.initStatePtr = initialState;
+  simConfig.dt = node->get_parameter("sim_dt").as_double();
+  simConfig.jointDamping = node->get_parameter("joint_damping").as_double();
+  simConfig.groundStaticFriction = node->get_parameter("ground_static_friction").as_double();
+  simConfig.groundDynamicFriction = node->get_parameter("ground_dynamic_friction").as_double();
+  simConfig.groundDissipation = node->get_parameter("ground_dissipation").as_double();
+  simConfig.groundPointStiffness = node->get_parameter("ground_point_stiffness").as_double();
+  simConfig.forceContactFlags = node->get_parameter("force_mujoco_contact_flags").as_bool();
+  simConfig.resetOnFall = node->get_parameter("reset_on_fall").as_bool();
+  simConfig.fallHeight = node->get_parameter("fall_z_threshold").as_double();
+  simConfig.resetPause = node->get_parameter("reset_cooldown_s").as_double();
+  simConfig.enableVisualization = node->get_parameter("enable_meshcat").as_bool();
+  simConfig.meshcatHost = node->get_parameter("meshcat_host").as_string();
+  simConfig.verbose = node->get_parameter("verbose").as_bool();
 
-  DrakeMrtConfig cfg;
-  cfg.drake_model_path = drake_model_file;
+  robot::drake_sim_interface::DrakeSimInterface robotInterface(simConfig, urdfFile);
 
-  cfg.sim_dt = node->get_parameter("sim_dt").as_double();
-  cfg.control_rate_hz = node->get_parameter("control_rate_hz").as_double();
-  cfg.max_torque = node->get_parameter("max_torque").as_double();
-  cfg.initial_height_override = node->get_parameter("initial_height").as_double();
+  const auto mpcJointIndices =
+      robotInterface.getRobotDescription().getJointIndices(modelSettings.mpcModelJointNames);
+  const auto fixedJointIndices =
+      robotInterface.getRobotDescription().getJointIndices(modelSettings.fixedJointNames);
 
-  cfg.startup_pin_duration_s = node->get_parameter("startup_pin_duration_s").as_double();
-
-  cfg.reset_on_fall = node->get_parameter("reset_on_fall").as_bool();
-  cfg.reset_cooldown_s = node->get_parameter("reset_cooldown_s").as_double();
-  cfg.fall_z_threshold = node->get_parameter("fall_z_threshold").as_double();
-  cfg.fall_angle_threshold_rad = node->get_parameter("fall_angle_threshold_rad").as_double();
-
-  cfg.passive_joint_damping = node->get_parameter("passive_joint_damping").as_double();
-  cfg.force_mujoco_contact_flags = node->get_parameter("force_mujoco_contact_flags").as_bool();
-  cfg.direct_mujoco_torque_mode = node->get_parameter("direct_mujoco_torque_mode").as_bool();
-  cfg.control_mode = node->get_parameter("control_mode").as_string();
-  cfg.enable_sap_pd_controller = node->get_parameter("enable_sap_pd_controller").as_bool();
-  cfg.sap_pd_hold_duration_s = node->get_parameter("sap_pd_hold_duration_s").as_double();
-  cfg.sap_pd_blend_duration_s = node->get_parameter("sap_pd_blend_duration_s").as_double();
-  cfg.mrt_torque_scale = node->get_parameter("mrt_torque_scale").as_double();
-  cfg.max_torque_rate = node->get_parameter("max_torque_rate").as_double();
-
-  if (cfg.control_mode != "sap_pd_stand" && cfg.control_mode != "mrt_walk" && cfg.control_mode != "mrt_direct") {
-    RCLCPP_WARN(node->get_logger(), "Unknown control_mode='%s'. Falling back to sap_pd_stand.", cfg.control_mode.c_str());
-    cfg.control_mode = "sap_pd_stand";
+  std::vector<double> mpcJointKp(mpcJointIndices.size());
+  std::vector<double> mpcJointKd(mpcJointIndices.size());
+  for (size_t i = 0; i < mpcJointIndices.size(); ++i) {
+    mpcJointKp[i] = trackingKp(modelSettings.mpcModelJointNames[i]);
+    mpcJointKd[i] = trackingKd(modelSettings.mpcModelJointNames[i]);
   }
 
-  cfg.ground_static_friction = node->get_parameter("ground_static_friction").as_double();
-  cfg.ground_dynamic_friction = node->get_parameter("ground_dynamic_friction").as_double();
-  cfg.ground_dissipation = node->get_parameter("ground_dissipation").as_double();
-  cfg.ground_point_stiffness = node->get_parameter("ground_point_stiffness").as_double();
-  cfg.ground_hydro_modulus = node->get_parameter("ground_hydro_modulus").as_double();
-  cfg.ground_hydro_margin = node->get_parameter("ground_hydro_margin").as_double();
+  std::vector<double> fixedJointKp(fixedJointIndices.size());
+  std::vector<double> fixedJointKd(fixedJointIndices.size());
+  for (size_t i = 0; i < fixedJointIndices.size(); ++i) {
+    fixedJointKp[i] = trackingKp(modelSettings.fixedJointNames[i]);
+    fixedJointKd[i] = trackingKd(modelSettings.fixedJointNames[i]);
+  }
 
-  cfg.meshcat_host = node->get_parameter("meshcat_host").as_string();
+  // Target trajectories calculator for reset messages
+  CentroidalMpcTargetTrajectoriesCalculator targetCalculator(
+      referenceFile, mpcModel, pinocchioInterface,
+      interface.getCentroidalModelInfo(), interface.mpcSettings().timeHorizon_);
+  const vector_t& initMpcState = interface.getInitialState();
+  const double nominalPelvisZ = mpcModel.getBasePosition(initMpcState).z();
 
-  cfg.debug_publish_rate_hz = node->get_parameter("debug_publish_rate_hz").as_double();
-  cfg.debug_log_period_s = node->get_parameter("debug_log_period_s").as_double();
-  cfg.debug_top_joints = node->get_parameter("debug_top_joints").as_int();
-  cfg.debug_verbose = node->get_parameter("debug_verbose").as_bool();
+  // Root Cause 3 Fix: Read reference.info velocity multipliers and configure safe
+  // velocity command scaling/clamping bridge (/humanoid/walking_velocity_command ->
+  // /humanoid/walking_velocity_command_clamped).
+  scalar_t refMaxVelX = 2.4;
+  scalar_t refMaxVelY = 1.2;
+  scalar_t refMaxVelYaw = 1.0;
+  loadData::loadCppDataType(referenceFile, "maxDisplacementVelocityX", refMaxVelX);
+  loadData::loadCppDataType(referenceFile, "maxDisplacementVelocityY", refMaxVelY);
+  loadData::loadCppDataType(referenceFile, "maxRotationVelocity", refMaxVelYaw);
 
-  RCLCPP_INFO(node->get_logger(),
-              "Args:\n"
-              "  robot=%s\n"
-              "  task=%s\n"
-              "  reference=%s\n"
-              "  urdf=%s\n"
-              "  gait=%s\n"
-              "  drake_model=%s",
-              robot_name.c_str(), task_file.c_str(), reference_file.c_str(), urdf_file.c_str(), gait_file.c_str(),
-              drake_model_file.c_str());
+  const double maxForwardVelX = std::max(0.1, node->get_parameter("max_forward_vel_x").as_double());
+  const double maxBackwardVelX = std::max(0.1, node->get_parameter("max_backward_vel_x").as_double());
+  const double maxLateralVelY = std::max(0.05, node->get_parameter("max_lateral_vel_y").as_double());
+  const double maxYawRateZ = std::max(0.05, node->get_parameter("max_yaw_rate_z").as_double());
+  const double minPelvisHeight = node->get_parameter("min_pelvis_height").as_double();
+  const double maxPelvisHeight = node->get_parameter("max_pelvis_height").as_double();
 
-  RCLCPP_INFO(node->get_logger(),
-              "Runtime config:\n"
-              "  sim_dt=%.6f control_rate_hz=%.1f\n"
-              "  startup_pin_duration_s=%.3f reset_on_fall=%d reset_cooldown_s=%.3f\n"
-              "  passive_joint_damping=%.2f force_mujoco_contact_flags=%d "
-              "direct_mujoco_torque_mode=%d\n"
-              "  control_mode=%s enable_sap_pd_controller=%d "
-              "sap_pd_hold=%.3f sap_pd_blend=%.3f mrt_torque_scale=%.2f "
-              "max_torque_rate=%.1f\n"
-              "  ground mu=[%.2f %.2f] dissipation=%.2f point_stiffness=%.1e "
-              "hydro_modulus=%.1e",
-              cfg.sim_dt, cfg.control_rate_hz, cfg.startup_pin_duration_s, cfg.reset_on_fall ? 1 : 0, cfg.reset_cooldown_s,
-              cfg.passive_joint_damping, cfg.force_mujoco_contact_flags ? 1 : 0, cfg.direct_mujoco_torque_mode ? 1 : 0,
-              cfg.control_mode.c_str(), cfg.enable_sap_pd_controller ? 1 : 0, cfg.sap_pd_hold_duration_s, cfg.sap_pd_blend_duration_s,
-              cfg.mrt_torque_scale, cfg.max_torque_rate, cfg.ground_static_friction, cfg.ground_dynamic_friction, cfg.ground_dissipation,
-              cfg.ground_point_stiffness, cfg.ground_hydro_modulus);
+  auto humanoidVisualizer = std::make_shared<HumanoidVisualizer>(
+      taskFile, interface.getPinocchioInterface(),
+      interface.getMpcRobotModel(), node);
 
-  CentroidalMpcInterface interface(task_file, urdf_file, reference_file);
-
-  SqpMpc mpc(interface.mpcSettings(), interface.sqpSettings(), interface.getOptimalControlProblem(), interface.getInitializer());
-
+  // Instantiate MRT ROS Interface
   auto qos = rclcpp::QoS(1).best_effort();
+  MRT_ROS_Interface mrt(robotName);
+  mrt.launchNodes(node, qos);
 
-  auto humanoid_visualizer =
-      std::make_shared<HumanoidVisualizer>(task_file, interface.getPinocchioInterface(), interface.getMpcRobotModel(), node);
+  auto clampedVelPub =
+      node->create_publisher<humanoid_mpc_msgs::msg::WalkingVelocityCommand>(
+          "/humanoid/walking_velocity_command_clamped", qos);
 
-  CentroidalMpcTargetTrajectoriesCalculator target_calc(reference_file, interface.getMpcRobotModel(), interface.getPinocchioInterface(),
-                                                        interface.getCentroidalModelInfo(), interface.mpcSettings().timeHorizon_);
+  std::mutex velCmdMutex;
+  bool blockExternalVelCmds = false;
+  double postResetHoldUntilSimTime = -1.0;
+  bool wasActivelyWalking = false;
+  bool stopAlignmentPendingZero = false;
+  auto stopAlignUntilWallTime = std::chrono::steady_clock::time_point::min();
 
-  ProceduralMpcMotionManager::VelocityTargetToTargetTrajectories target_func =
-      [&target_calc](const vector4_t& velocity_target, scalar_t init_time, scalar_t final_time, const vector_t& init_state) mutable {
-        (void)final_time;
-        return target_calc.commandedVelocityToTargetTrajectories(velocity_target, init_time, init_state);
-      };
+  auto publishZeroVelocityCommand = [&]() {
+    humanoid_mpc_msgs::msg::WalkingVelocityCommand zeroMsg;
+    zeroMsg.linear_velocity_x = 0.0;
+    zeroMsg.linear_velocity_y = 0.0;
+    zeroMsg.angular_velocity_z = 0.0;
+    zeroMsg.desired_pelvis_height = nominalPelvisZ;
+    clampedVelPub->publish(zeroMsg);
+  };
 
-  auto motion_manager = std::make_shared<Ros2ProceduralMpcMotionManager>(
-      gait_file, reference_file, interface.getSwitchedModelReferenceManagerPtr(), interface.getMpcRobotModel(), target_func);
+  auto rawVelSub =
+      node->create_subscription<humanoid_mpc_msgs::msg::WalkingVelocityCommand>(
+          "/humanoid/walking_velocity_command", rclcpp::QoS(10).best_effort(),
+          [&](const humanoid_mpc_msgs::msg::WalkingVelocityCommand::SharedPtr msg) {
+            std::lock_guard<std::mutex> lock(velCmdMutex);
+            if (blockExternalVelCmds) {
+              wasActivelyWalking = false;
+              stopAlignmentPendingZero = false;
+              publishZeroVelocityCommand();
+              return;
+            }
+            const double rawVx = std::isfinite(msg->linear_velocity_x)
+                                     ? std::clamp(msg->linear_velocity_x, -1.0, 1.0)
+                                     : 0.0;
+            const double rawVy = std::isfinite(msg->linear_velocity_y)
+                                     ? std::clamp(msg->linear_velocity_y, -1.0, 1.0)
+                                     : 0.0;
+            const double rawWz = std::isfinite(msg->angular_velocity_z)
+                                     ? std::clamp(msg->angular_velocity_z, -1.0, 1.0)
+                                     : 0.0;
+            const double rawH = (std::isfinite(msg->desired_pelvis_height) &&
+                                 msg->desired_pelvis_height > 0.1)
+                                    ? msg->desired_pelvis_height
+                                    : nominalPelvisZ;
 
-  motion_manager->subscribe(node, qos);
+            const bool isZeroCmd = (std::abs(rawVx) < 0.02 &&
+                                    std::abs(rawVy) < 0.02 &&
+                                    std::abs(rawWz) < 0.02);
+            const auto nowWall = std::chrono::steady_clock::now();
 
-  mpc.getSolverPtr()->setReferenceManager(interface.getReferenceManagerPtr());
-  mpc.getSolverPtr()->addSynchronizedModule(motion_manager);
+            if (!isZeroCmd) {
+              if (std::abs(rawVx) >= 0.05 || std::abs(rawVy) >= 0.05 || std::abs(rawWz) >= 0.05) {
+                wasActivelyWalking = true;
+              }
+              stopAlignmentPendingZero = false;
+            } else if (wasActivelyWalking) {
+              wasActivelyWalking = false;
+              stopAlignmentPendingZero = true;
+              stopAlignUntilWallTime = nowWall + std::chrono::milliseconds(750);
+            }
 
-  robot::model::RobotDescription robot_description(urdf_file);
+            // Smooth soft-saturation mapping raw [-1, 1] command to safe physical velocities
+            double physVx =
+                (rawVx >= 0.0)
+                    ? (maxForwardVelX * std::tanh(rawVx / 0.42))
+                    : (maxBackwardVelX * std::tanh(rawVx / 0.35));
+            double physVy = maxLateralVelY * std::tanh(rawVy / 0.50);
+            const double linearLoad = std::clamp(std::hypot(rawVx, rawVy), 0.0, 1.0);
+            const double yawTurnScale = 1.0 - 0.25 * linearLoad;
+            double physWz = maxYawRateZ * yawTurnScale * std::tanh(rawWz / 0.55);
+            double safeH = std::clamp(rawH, minPelvisHeight, maxPelvisHeight);
 
-  robot::model::RobotState init_state(robot_description, 2);
-  init_state.setConfigurationToZero();
+            // Root Cause B Fix: Hold a brief 0.75 s slow_walk centering window (physVx = 0.055 m/s)
+            // when returning to Center so the feet step underneath the hips at nominalPelvisZ
+            // before ModeNumber::STANCE locks both feet in place.
+            if (isZeroCmd && stopAlignmentPendingZero) {
+              if (nowWall < stopAlignUntilWallTime) {
+                physVx = 0.055;
+                physVy = 0.0;
+                physWz = 0.0;
+                safeH = nominalPelvisZ;
+              } else {
+                stopAlignmentPendingZero = false;
+                physVx = 0.0;
+                physVy = 0.0;
+                physWz = 0.0;
+                safeH = nominalPelvisZ;
+              }
+            }
 
-  const vector_t& init_mpc_state = interface.getInitialState();
-  const auto& mpc_model = interface.getMpcRobotModel();
+            humanoid_mpc_msgs::msg::WalkingVelocityCommand outMsg;
+            outMsg.linear_velocity_x =
+                (std::abs(refMaxVelX) > 1e-6) ? (physVx / refMaxVelX) : physVx;
+            outMsg.linear_velocity_y =
+                (std::abs(refMaxVelY) > 1e-6) ? (physVy / refMaxVelY) : physVy;
+            outMsg.angular_velocity_z =
+                (std::abs(refMaxVelYaw) > 1e-6) ? (physWz / refMaxVelYaw) : physWz;
+            outMsg.desired_pelvis_height = safeH;
+            clampedVelPub->publish(outMsg);
+          });
+  (void)rawVelSub;
 
-  init_state.setRootPositionInWorldFrame(mpc_model.getBasePosition(init_mpc_state));
+  // =========================================================================
+  // STEP 1: Hold G1 in Nominal Upright Pose in Drake Without Advancing Physics
+  // =========================================================================
+  RCLCPP_INFO(node->get_logger(),
+              "[STARTUP STEP 1/5] Holding G1 in nominal pose in Drake (physics held at t=0)...");
+  robotInterface.initSim();
+  robotInterface.updateInterfaceStateFromRobot();
 
-  const vector_t mpc_joint_angles = mpc_model.getJointAngles(init_mpc_state);
+  // Pre-populate nominal joint holding PD
+  auto& jointAction = robotInterface.getRobotJointAction();
+  for (size_t i = 0; i < mpcJointIndices.size(); ++i) {
+    const size_t jIdx = mpcJointIndices[i];
+    auto& act = jointAction.at(jIdx).value();
+    act.q_des = initialState->getJointPosition(jIdx);
+    act.qd_des = 0.0;
+    act.kp = mpcJointKp[i];
+    act.kd = mpcJointKd[i];
+    act.feed_forward_effort = 0.0;
+  }
+  for (size_t i = 0; i < fixedJointIndices.size(); ++i) {
+    const size_t jIdx = fixedJointIndices[i];
+    auto& act = jointAction.at(jIdx).value();
+    act.q_des = initialState->getJointPosition(jIdx);
+    act.qd_des = 0.0;
+    act.kp = fixedJointKp[i];
+    act.kd = fixedJointKd[i];
+    act.feed_forward_effort = 0.0;
+  }
+  robotInterface.applyJointAction();
 
-  const auto mpc_joint_indices = robot_description.getJointIndices(interface.modelSettings().mpcModelJointNames);
+  // =========================================================================
+  // STEP 2: Call /g1/mpc_reset Service on Node 1
+  // =========================================================================
+  RCLCPP_INFO(node->get_logger(),
+              "[STARTUP STEP 2/5] Calling /%s/mpc_reset service with initial stance trajectory...",
+              robotName.c_str());
+  const vector4_t initialVelTarget(0.0, 0.0, nominalPelvisZ, 0.0);
+  auto initialTargetTrajectories =
+      targetCalculator.commandedVelocityToTargetTrajectories(initialVelTarget, 0.0, initMpcState);
+  mrt.resetMpcNode(initialTargetTrajectories);
 
-  for (size_t i = 0; i < mpc_joint_indices.size(); ++i) {
-    init_state.setJointPosition(mpc_joint_indices[i], mpc_joint_angles[static_cast<Eigen::Index>(i)]);
+  // =========================================================================
+  // STEP 3: Run Observation Warm-Up Loop (30 Cycles at 100 Hz)
+  // =========================================================================
+  RCLCPP_INFO(node->get_logger(),
+              "[STARTUP STEP 3/5] Priming Node 1 static alpha-filter (30 cycles @ 100 Hz)...");
+  SystemObservation initObs;
+  initObs.time = 0.0;
+  initObs.state = initMpcState;
+  initObs.input = vector_t::Zero(mpcModel.getInputDim());
+  initObs.mode = ModeNumber::STANCE;
+
+  for (int cycle = 0; cycle < 30 && rclcpp::ok(); ++cycle) {
+    mrt.setCurrentObservation(initObs);
+    mrt.spinMRT();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    mrt.updatePolicy();
   }
 
-  DrakeRobotRuntimeAdapter adapter(node, robot_description, init_state, cfg);
+  // =========================================================================
+  // STEP 4: Verify Receipt of Valid MPC Policy (Knot Height >= 0.78 m)
+  // =========================================================================
+  RCLCPP_INFO(node->get_logger(),
+              "[STARTUP STEP 4/5] Verifying received policy knot height >= 0.78 m...");
+  bool policyReady = false;
+  const auto verifyTimeout = std::chrono::steady_clock::now() + std::chrono::seconds(15);
 
-  CentroidalMpcMrtJointController controller(robot_description, interface.modelSettings(), interface.getMpcRobotModel(), mpc,
-                                             interface.getPinocchioInterface(), interface.mpcSettings().mpcDesiredFrequency_,
-                                             humanoid_visualizer);
+  while (rclcpp::ok() && std::chrono::steady_clock::now() < verifyTimeout) {
+    mrt.setCurrentObservation(initObs);
+    mrt.spinMRT();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    mrt.updatePolicy();
 
-  controller.startMpcThread(adapter.getRobotState());
-
-  while (rclcpp::ok() && !controller.ready()) {
-    rclcpp::spin_some(node);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (mrt.initialPolicyReceived()) {
+      const auto& policy = mrt.getPolicy();
+      if (!policy.stateTrajectory_.empty()) {
+        const double knotFrontZ = mpcModel.getBasePosition(policy.stateTrajectory_.front()).z();
+        const double knotBackZ = mpcModel.getBasePosition(policy.stateTrajectory_.back()).z();
+        if (knotFrontZ >= 0.78 && knotBackZ >= 0.78) {
+          policyReady = true;
+          RCLCPP_INFO(node->get_logger(),
+                      "[STARTUP STEP 4/5 PASSED] Valid policy verified! Front=%.4f m, Back=%.4f m (>= 0.78 m)",
+                      knotFrontZ, knotBackZ);
+          break;
+        } else {
+          RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 500,
+                               "[STARTUP WARMUP] Waiting for filter convergence: Front=%.4f m, Back=%.4f m (target >= 0.78 m)",
+                               knotFrontZ, knotBackZ);
+        }
+      }
+    }
+  }
+  if (!policyReady) {
+    throw std::runtime_error("Startup synchronization failed: Node 1 policy knot height < 0.78 m");
   }
 
-  adapter.markControllerReady();
+  // =========================================================================
+  // STEP 5: Release 2000 Hz Physics Stepping & Enter Active Control Loop
+  // =========================================================================
+  RCLCPP_INFO(node->get_logger(),
+              "[STARTUP STEP 5/5] Releasing 2000 Hz physics simulation & entering 500 Hz follower loop...");
 
-  RCLCPP_INFO(node->get_logger(), "Initial MRT policy received; entering Drake control loop.");
+  // Pre-evaluate policy at t = 0.005 s for initial feedforward holding torques
+  vector_t mpcPolicyState, mpcPolicyInput;
+  size_t mpcPolicyMode;
+  mrt.evaluatePolicy(0.005, initMpcState, mpcPolicyState, mpcPolicyInput, mpcPolicyMode);
 
-  const double control_period_s = 1.0 / cfg.control_rate_hz;
+  vector_t mpc_q_des = mpcModel.getJointAngles(mpcPolicyState);
+  vector_t mpc_qd_des = mpcModel.getJointVelocities(mpcPolicyState, mpcPolicyInput);
+  vector_t qdd_des = vector_t::Zero(mpcModel.getJointDim());
+  std::array<vector6_t, 2> footWrenches = {
+      mpcModel.getContactWrench(mpcPolicyInput, 0),
+      mpcModel.getContactWrench(mpcPolicyInput, 1)};
 
-  const int physics_steps_per_control = std::max(1, static_cast<int>(std::round(control_period_s / cfg.sim_dt)));
+  vector_t q = mpcModel.getGeneralizedCoordinates(initMpcState);
+  vector_t qd = mpcModel.getGeneralizedVelocities(initMpcState, initObs.input);
+  vector_t ffTorques = computeJointTorques<scalar_t>(q, qd, qdd_des, footWrenches, pinocchioInterface);
 
-  const auto control_dt = std::chrono::microseconds(static_cast<int>(1e6 / cfg.control_rate_hz));
+  for (size_t i = 0; i < mpcJointIndices.size(); ++i) {
+    const size_t jIdx = mpcJointIndices[i];
+    auto& act = jointAction.at(jIdx).value();
+    act.q_des = mpc_q_des[i];
+    act.qd_des = mpc_qd_des[i];
+    act.kp = mpcJointKp[i];
+    act.kd = mpcJointKd[i];
+    act.feed_forward_effort =
+        ffTorques[i] + simConfig.jointDamping * mpc_qd_des[i];
+  }
+  for (size_t i = 0; i < fixedJointIndices.size(); ++i) {
+    const size_t jIdx = fixedJointIndices[i];
+    auto& act = jointAction.at(jIdx).value();
+    act.q_des = initialState->getJointPosition(jIdx);
+    act.qd_des = 0.0;
+    act.kp = fixedJointKp[i];
+    act.kd = fixedJointKd[i];
+    act.feed_forward_effort = 0.0;
+  }
+  robotInterface.applyJointAction();
+
+  // START 2000 Hz Drake Physics Thread
+  robotInterface.startSim();
 
   RCLCPP_INFO(node->get_logger(),
-              "Loop schedule: control_period=%.6fs sim_dt=%.6fs "
-              "physics_steps_per_control=%d simulated_dt_per_control=%.6fs",
-              control_period_s, cfg.sim_dt, physics_steps_per_control, physics_steps_per_control * cfg.sim_dt);
+              "Drake URDF simulation started: dt=%.6f s, control=%.1f Hz; "
+              "MRT is the only joint controller",
+              simConfig.dt, node->get_parameter("control_rate_hz").as_double());
+  if (simConfig.enableVisualization) {
+    RCLCPP_INFO(node->get_logger(), "Meshcat: %s",
+                robotInterface.getVisualizationUrl().c_str());
+    RCLCPP_INFO(node->get_logger(), "Meshcat server scene: %s",
+                robotInterface.getVisualizationStatus().c_str());
+  }
 
-  int loop_count = 0;
+  // Control loop timing
+  const double controlRateHz = node->get_parameter("control_rate_hz").as_double();
+  const auto controlPeriod = std::chrono::microseconds(
+      std::max<int64_t>(1, static_cast<int64_t>(std::llround(1.0e6 / controlRateHz))));
+  const double meshcatRateHz = node->get_parameter("meshcat_publish_rate_hz").as_double();
+  const auto meshcatPeriod = std::chrono::microseconds(
+      meshcatRateHz > 0.0
+          ? std::max<int64_t>(1, static_cast<int64_t>(std::llround(1.0e6 / meshcatRateHz)))
+          : 1);
+
+  uint64_t lastFallCount = robotInterface.getFallResetCount();
+  auto nextIteration = std::chrono::steady_clock::now();
+  auto nextVisualization = nextIteration;
+  SystemObservation currentObs;
+  currentObs.state = initMpcState;
+  currentObs.input = vector_t::Zero(mpcModel.getInputDim());
+
+  const size_t obsDecimation = std::max<size_t>(
+      1, static_cast<size_t>(std::round(controlRateHz / 40.0)));
+  size_t loopIteration = 0;
+  double lastTelemetrySimTime = -1.0;
+  double mpcTimeOffset = 0.0;
+  ContinuousYawUnwrapper yawUnwrapper;
 
   while (rclcpp::ok()) {
-    const auto loop_start = std::chrono::steady_clock::now();
-    const auto next_tick = loop_start + control_dt;
+    nextIteration += controlPeriod;
+    const uint64_t currentFallCount = robotInterface.getFallResetCount();
 
-    const auto t0 = std::chrono::steady_clock::now();
+    // =======================================================================
+    // Fall Detection & Recovery Reset (Root Cause 2 Fix)
+    // =======================================================================
+    if (currentFallCount > lastFallCount) {
+      const auto recoveryWallStart = std::chrono::steady_clock::now();
+      RCLCPP_WARN(node->get_logger(),
+                  "[FALL RECOVERY] Fall detected (%lu -> %lu). Executing synchronized recovery protocol...",
+                  lastFallCount, currentFallCount);
+      lastFallCount = currentFallCount;
+      loopIteration = 0;
+      lastTelemetrySimTime = -1.0;
+      yawUnwrapper.reset();
 
-    controller.computeJointControlAction(adapter.getRobotState().getTime(), adapter.getRobotState(), adapter.getRobotJointAction());
+      robotInterface.updateInterfaceStateFromRobot();
+      const double resetSimTime = robotInterface.getRobotState().getTime();
 
-    const auto t1 = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(velCmdMutex);
+        blockExternalVelCmds = true;
+        wasActivelyWalking = false;
+        stopAlignmentPendingZero = false;
+        postResetHoldUntilSimTime = resetSimTime + 1.0;
+        publishZeroVelocityCommand();
+      }
 
-    for (int i = 0; i < physics_steps_per_control; ++i) {
-      adapter.stepOnce();
+      // Phase A: Flush Node 1 velocityCommandFilter & step ProceduralMpcMotionManager
+      // down to ModeNumber::STANCE by advancing mpcTimeOffset across 25 cycles.
+      SystemObservation resetObs;
+      resetObs.state = initMpcState;
+      resetObs.input = vector_t::Zero(mpcModel.getInputDim());
+      resetObs.mode = ModeNumber::STANCE;
+      for (int c = 0; c < 25 && rclcpp::ok(); ++c) {
+        publishZeroVelocityCommand();
+        mpcTimeOffset += 0.08;
+        resetObs.time = resetSimTime + mpcTimeOffset;
+        mrt.setCurrentObservation(resetObs);
+        mrt.spinMRT();
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        mrt.updatePolicy();
+      }
+
+      // Phase B: Reset Node 1 reference trajectory & solver cache at synchronized time
+      resetObs.time = resetSimTime + mpcTimeOffset;
+      auto resetTargetTrajectories =
+          targetCalculator.commandedVelocityToTargetTrajectories(
+              initialVelTarget, resetObs.time, initMpcState);
+      mrt.resetMpcNode(resetTargetTrajectories);
+
+      // Phase C: Re-warmup observation burst & verify STANCE mode + knot height >= 0.78 m
+      for (int c = 0; c < 20 && rclcpp::ok(); ++c) {
+        publishZeroVelocityCommand();
+        mrt.setCurrentObservation(resetObs);
+        mrt.spinMRT();
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        mrt.updatePolicy();
+        if (mrt.initialPolicyReceived()) {
+          const auto& policy = mrt.getPolicy();
+          if (!policy.stateTrajectory_.empty()) {
+            const double frontZ = mpcModel.getBasePosition(policy.stateTrajectory_.front()).z();
+            const double backZ = mpcModel.getBasePosition(policy.stateTrajectory_.back()).z();
+            const bool allStance = std::all_of(
+                policy.modeSchedule_.modeSequence.begin(),
+                policy.modeSchedule_.modeSequence.end(),
+                [](size_t m) { return m == ModeNumber::STANCE; });
+            if (c >= 10 && frontZ >= 0.78 && backZ >= 0.78 && allStance) {
+              break;
+            }
+          }
+        }
+      }
+
+      // Synchronize with remaining DrakeSimInterface reset_cooldown_s before releasing control
+      const auto cooldownDeadline =
+          recoveryWallStart +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(std::max(0.0, simConfig.resetPause - 0.05)));
+      while (rclcpp::ok() && std::chrono::steady_clock::now() < cooldownDeadline) {
+        publishZeroVelocityCommand();
+        mrt.setCurrentObservation(resetObs);
+        mrt.spinMRT();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        mrt.updatePolicy();
+      }
+
+      // Re-apply fresh holding action right as physics resumes
+      robotInterface.updateInterfaceStateFromRobot();
+      updateMpcObservation(currentObs, robotInterface.getRobotState(), mpcModel,
+                           pinocchioInterface, mpcJointIndices, yawUnwrapper,
+                           mpcTimeOffset);
+      mrt.evaluatePolicy(currentObs.time + 0.005, currentObs.state, mpcPolicyState,
+                         mpcPolicyInput, mpcPolicyMode);
+      mpc_q_des = mpcModel.getJointAngles(mpcPolicyState);
+      mpc_qd_des = mpcModel.getJointVelocities(mpcPolicyState, mpcPolicyInput);
+      qdd_des.setZero();
+      footWrenches = {mpcModel.getContactWrench(mpcPolicyInput, 0),
+                      mpcModel.getContactWrench(mpcPolicyInput, 1)};
+      q = mpcModel.getGeneralizedCoordinates(currentObs.state);
+      qd = mpcModel.getGeneralizedVelocities(currentObs.state, currentObs.input);
+      ffTorques = computeJointTorques<scalar_t>(q, qd, qdd_des, footWrenches, pinocchioInterface);
+
+      for (size_t i = 0; i < mpcJointIndices.size(); ++i) {
+        const size_t jIdx = mpcJointIndices[i];
+        auto& act = jointAction.at(jIdx).value();
+        act.q_des = mpc_q_des[i];
+        act.qd_des = mpc_qd_des[i];
+        act.kp = mpcJointKp[i];
+        act.kd = mpcJointKd[i];
+        act.feed_forward_effort =
+            ffTorques[i] + simConfig.jointDamping * mpc_qd_des[i];
+      }
+      for (size_t i = 0; i < fixedJointIndices.size(); ++i) {
+        const size_t jIdx = fixedJointIndices[i];
+        auto& act = jointAction.at(jIdx).value();
+        act.q_des = initialState->getJointPosition(jIdx);
+        act.qd_des = 0.0;
+        act.kp = fixedJointKp[i];
+        act.kd = fixedJointKd[i];
+        act.feed_forward_effort = 0.0;
+      }
+      robotInterface.applyJointAction();
+      nextIteration = std::chrono::steady_clock::now();
+      RCLCPP_INFO(node->get_logger(), "[FALL RECOVERY] Stance re-established.");
+    } else {
+      // =====================================================================
+      // Active 500 Hz Follower Loop
+      // =====================================================================
+      robotInterface.updateInterfaceStateFromRobot();
+      const auto& currentRobotState = robotInterface.getRobotState();
+      updateMpcObservation(currentObs, currentRobotState, mpcModel,
+                           pinocchioInterface, mpcJointIndices, yawUnwrapper,
+                           mpcTimeOffset);
+
+      // Release post-reset velocity command hold once robot has stood stably for 1.0 s
+      {
+        std::lock_guard<std::mutex> lock(velCmdMutex);
+        if (blockExternalVelCmds) {
+          if (currentRobotState.getTime() >= postResetHoldUntilSimTime) {
+            blockExternalVelCmds = false;
+          } else if (loopIteration % obsDecimation == 0) {
+            publishZeroVelocityCommand();
+          }
+        } else if (stopAlignmentPendingZero &&
+                   std::chrono::steady_clock::now() >= stopAlignUntilWallTime) {
+          stopAlignmentPendingZero = false;
+          publishZeroVelocityCommand();
+        }
+      }
+
+      // Publish observation to Node 1 decimated to ~40 Hz (avoids SQP queue backlog)
+      if (loopIteration % obsDecimation == 0) {
+        mrt.setCurrentObservation(currentObs);
+      }
+      ++loopIteration;
+
+      // Spin MRT callbacks & update policy buffer
+      mrt.spinMRT();
+      mrt.updatePolicy();
+
+      // Evaluate active policy at t + 0.005 s and t + 0.015 s for finite-difference qdd_des
+      constexpr double kEvalLookaheadSec = 0.005;
+      constexpr double kAccelFiniteDiffDt = 0.010;
+      constexpr double kMaxJointAccel = 35.0;
+      mrt.evaluatePolicy(currentObs.time + kEvalLookaheadSec, currentObs.state,
+                         mpcPolicyState, mpcPolicyInput, mpcPolicyMode);
+      vector_t mpcPolicyStateAhead, mpcPolicyInputAhead;
+      size_t mpcPolicyModeAhead = mpcPolicyMode;
+      mrt.evaluatePolicy(currentObs.time + kEvalLookaheadSec + kAccelFiniteDiffDt,
+                         currentObs.state, mpcPolicyStateAhead, mpcPolicyInputAhead,
+                         mpcPolicyModeAhead);
+
+      mpc_q_des = mpcModel.getJointAngles(mpcPolicyState);
+      mpc_qd_des = mpcModel.getJointVelocities(mpcPolicyState, mpcPolicyInput);
+      const vector_t mpc_qd_des_ahead =
+          mpcModel.getJointVelocities(mpcPolicyStateAhead, mpcPolicyInputAhead);
+      for (Eigen::Index j = 0; j < qdd_des.size(); ++j) {
+        const double raw_qdd = (mpc_qd_des_ahead[j] - mpc_qd_des[j]) / kAccelFiniteDiffDt;
+        qdd_des[j] = std::isfinite(raw_qdd)
+                         ? std::clamp(raw_qdd, -kMaxJointAccel, kMaxJointAccel)
+                         : 0.0;
+      }
+      footWrenches = {mpcModel.getContactWrench(mpcPolicyInput, 0),
+                      mpcModel.getContactWrench(mpcPolicyInput, 1)};
+      q = mpcModel.getGeneralizedCoordinates(currentObs.state);
+      qd = mpcModel.getGeneralizedVelocities(currentObs.state, currentObs.input);
+      ffTorques = computeJointTorques<scalar_t>(q, qd, qdd_des, footWrenches, pinocchioInterface);
+
+      for (size_t i = 0; i < mpcJointIndices.size(); ++i) {
+        const size_t jIdx = mpcJointIndices[i];
+        auto& act = jointAction.at(jIdx).value();
+        act.q_des = mpc_q_des[i];
+        act.qd_des = mpc_qd_des[i];
+        act.kp = mpcJointKp[i];
+        act.kd = mpcJointKd[i];
+        act.feed_forward_effort =
+            ffTorques[i] + simConfig.jointDamping * mpc_qd_des[i];
+      }
+      for (size_t i = 0; i < fixedJointIndices.size(); ++i) {
+        const size_t jIdx = fixedJointIndices[i];
+        auto& act = jointAction.at(jIdx).value();
+        act.q_des = initialState->getJointPosition(jIdx);
+        act.qd_des = 0.0;
+        act.kp = fixedJointKp[i];
+        act.kd = fixedJointKd[i];
+        act.feed_forward_effort = 0.0;
+      }
+      robotInterface.applyJointAction();
     }
 
-    const auto t2 = std::chrono::steady_clock::now();
-
-    rclcpp::spin_some(node);
-
-    const auto t3 = std::chrono::steady_clock::now();
-
-    const double mrt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    const double step_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    const double spin_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    const double total_ms = std::chrono::duration<double, std::milli>(t3 - loop_start).count();
-
-    const double budget_ms = 1000.0 / cfg.control_rate_hz;
-    const double overrun_ms = total_ms - budget_ms;
-
-    const double sim_advanced_s = physics_steps_per_control * cfg.sim_dt;
-    const double rtf_estimate = sim_advanced_s / std::max(1e-9, total_ms * 1e-3);
-
-    if ((loop_count++ % std::max(1, static_cast<int>(cfg.control_rate_hz))) == 0) {
-      RCLCPP_INFO(node->get_logger(),
-                  "[loop_timing] sim_t=%.3f mrt=%.2fms drake_substeps=%d "
-                  "step=%.2fms spin=%.2fms total=%.2fms budget=%.2fms "
-                  "overrun=%.2fms rtf_est=%.3f",
-                  adapter.getSimTime(), mrt_ms, physics_steps_per_control, step_ms, spin_ms, total_ms, budget_ms, overrun_ms, rtf_estimate);
+    // Standing Telemetry Logging at 2 Hz
+    const auto& telemetryState = robotInterface.getRobotState();
+    const auto pelvisPos = telemetryState.getRootPositionInWorldFrame();
+    const auto pelvisRot = telemetryState.getRootRotationLocalToWorldFrame();
+    const double qx = pelvisRot.x(), qy = pelvisRot.y(), qz = pelvisRot.z(), qw = pelvisRot.w();
+    const double roll = std::atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
+    const double pitch = std::asin(std::clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0));
+    const double simTime = telemetryState.getTime();
+    if (lastTelemetrySimTime < 0.0 || (simTime - lastTelemetrySimTime) >= 0.5 || simTime < lastTelemetrySimTime) {
+      lastTelemetrySimTime = simTime;
+      RCLCPP_INFO(
+          node->get_logger(),
+          "[standing_telemetry] t_sim=%.3f s | pelvis_z=%.4f m | roll=%.4f rad | pitch=%.4f rad | falls=%lu",
+          simTime, pelvisPos.z(), roll, pitch,
+          robotInterface.getFallResetCount());
+      RCLCPP_INFO(
+          node->get_logger(),
+          "[walking_telemetry] t_sim=%.3f s | pelvis_x=%.4f m | pelvis_z=%.4f m | falls=%lu",
+          simTime, pelvisPos.x(), pelvisPos.z(),
+          robotInterface.getFallResetCount());
     }
 
-    if (overrun_ms > 0.0) {
-      RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
-                           "[loop_overrun] total=%.2fms budget=%.2fms overrun=%.2fms "
-                           "mrt=%.2fms drake=%.2fms spin=%.2fms substeps=%d",
-                           total_ms, budget_ms, overrun_ms, mrt_ms, step_ms, spin_ms, physics_steps_per_control);
+    // Meshcat & RViz Visualization
+    const auto now = std::chrono::steady_clock::now();
+    if (meshcatRateHz > 0.0 && now >= nextVisualization) {
+      try {
+        if (simConfig.enableVisualization) {
+          robotInterface.publishVisualization();
+        }
+        if (humanoidVisualizer && mrt.initialPolicyReceived()) {
+          humanoidVisualizer->update(currentObs, mrt.getPolicy(), mrt.getCommand());
+        }
+      } catch (const std::exception& e) {
+        RCLCPP_WARN_THROTTLE(
+            node->get_logger(), *node->get_clock(), 2000,
+            "[VISUALIZATION] Exception during visualization update: %s", e.what());
+      }
+      nextVisualization = now + meshcatPeriod;
     }
 
-    std::this_thread::sleep_until(next_tick);
+    std::this_thread::sleep_until(nextIteration);
+    if (std::chrono::steady_clock::now() > nextIteration + controlPeriod) {
+      nextIteration = std::chrono::steady_clock::now();
+    }
   }
 
+  mrt.shutdownNodes();
   rclcpp::shutdown();
   return 0;
 }

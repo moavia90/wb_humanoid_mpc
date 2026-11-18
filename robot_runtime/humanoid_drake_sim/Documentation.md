@@ -1,994 +1,563 @@
-# Corrected OCS2 MPC ↔ Drake Simulation Bridge for G1 Walking
+# Drake Humanoid Simulation Backend, 2-Node ROS 2 Architecture & Diagnostics Reference
 
-**The existing bridge code contains at least nine critical bugs** preventing MPC-driven walking: a QoS mismatch that silently drops all policy messages, incorrect MPC state vector assembly, wrong joint ordering between Drake and Pinocchio, a zero-position hold pose that collapses the robot, misuse of the `reset_solver` flag instead of the proper service call, incorrect interpretation of the `MpcFlattenedController` trajectory fields, an unstable simulation timestep, missing gravity compensation in the hold phase, and wrong observation timestamps. Below is the complete analysis and corrected source for all three files.
-
----
-
-## Bug analysis and what each fix addresses
-
-The **most critical bug is the QoS mismatch** on `/g1/mpc_policy`. The OCS2 `MPC_ROS_Interface` publishes with `rclcpp::QoS(1)` which in the manumerous/ocs2_ros2 fork uses **best-effort** reliability for real-time performance. The original bridge subscribes with the default `rclcpp::QoS(10)` which is **reliable**. In ROS 2, a reliable subscriber **cannot receive from a best-effort publisher** — messages are silently dropped with no error logged unless you check QoS events. This single bug means zero policies ever reach the bridge.
-
-The **second critical bug is the MPC state layout**. The OCS2 centroidal model state vector is `[h_com(6), base_pos(3), base_euler_ZYX(3), q_joints(23)]` — 35 dimensions. The original code likely assembles the state with the wrong field order (e.g., putting base pose first, or using XYZ Euler instead of ZYX). The Euler convention is **intrinsic ZYX**: `[yaw_z, pitch_y, roll_x]`, matching Pinocchio's convention for the centroidal model.
-
-The **third bug is the joint order mismatch**. Drake's actuator ordering follows the URDF XML parse order, while the MPC uses Pinocchio's depth-first kinematic tree traversal. These are usually the same for well-structured URDFs, but differ if the URDF has a different XML element order. The fix is **name-based mapping** built at runtime.
-
-The **fourth bug is the hold pose**. Using all-zeros causes the robot to stand with straight legs at full height, which is unstable and doesn't match the MPC's expected initial configuration at z=0.78m. The correct pose has bent knees (hip_pitch ≈ −0.2, knee ≈ 0.4, ankle_pitch ≈ −0.2).
-
-The **fifth bug** is using `reset_solver=true` in the observation message. The OCS2 `MpcObservation` message in the standard ROS2 fork **does not have a `reset_solver` field**. Solver resets use the dedicated `<robotName>_mpc_reset` ROS2 service.
-
-The **sixth bug** is misinterpreting `MpcFlattenedController`. The centroidal MPC's `state_trajectory[0].value` contains desired state `[h_com(6), base(6), q_joints(23)]` — so **desired joint positions are at indices 12–34**. The `input_trajectory[0].value` contains `[contact_forces(12), joint_velocities(23)]` — the last 23 values are joint velocities (the MPC's decision variables), which serve as velocity references in the tracking controller.
+This document provides the definitive architectural reference, physical modeling principles, synchronization protocols, and diagnostic executable catalog for the Unitree G1 humanoid simulation in `humanoid_drake_sim`. It details why the monolithic single-process MuJoCo replica failed in Drake, establishes the production **2-Node ROS 2 Topic-Based OCS2 Policy Architecture** with dedicated CPU core partitioning via `taskset`, details the startup/reset filter warm-up protocol that prevents robot squatting, and documents all 10 diagnostic executables in the package.
 
 ---
 
-## Corrected `drake_sim_node.cpp`
+## 1. Forensic Analysis: MuJoCo Monolithic Replication vs. Drake Realities
 
-```cpp
-///////////////////////////////////////////////////////////////////////////////
-// drake_sim_node.cpp
-// 
-// Drake physics simulation for the Unitree G1 humanoid robot.
-// Runs discrete-time MultibodyPlant at 1kHz with hydroelastic ground contact.
-//
-// Publishes:
-//   /drake/joint_states        (sensor_msgs/JointState)      — named joint q, qdot
-//   /drake/centroidal_state    (std_msgs/Float64MultiArray)   — [h_com(6), base_pose(6)]
-//
-// Subscribes:
-//   /drake/joint_torques       (std_msgs/Float64MultiArray)   — actuator torques
-//
-// Bug fixes vs. original:
-//   [FIX-1] Discrete timestep 1 ms (was 0 = continuous, unstable with contact)
-//   [FIX-2] Compliant-hydroelastic ground + SAP solver (was missing ground)
-//   [FIX-3] Nominal bent-knee init at z=0.78 m (was zero pose → collapse)
-//   [FIX-4] Proper centroidal state publication (ZYX Euler, CoM velocity)
-//   [FIX-5] Torque safety clamp to prevent simulation blow-up
-///////////////////////////////////////////////////////////////////////////////
+### 1.1 The MuJoCo Baseline Mechanics (`CentroidalMpcRobotSim.cpp`)
+In the baseline MuJoCo implementation (`src/wb_humanoid_mpc/humanoid_nmpc/humanoid_centroidal_mpc_ros2/src/CentroidalMpcRobotSim.cpp` and `mujoco_sim_interface`), all control and physics routines execute within a single monolithic operating system process:
 
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
+```text
+================================= MuJoCo Baseline =================================
+Process: humanoid_centroidal_mpc_sim (Single Monolithic Binary)
+  ├── Main Thread (500 Hz):
+  │     ├── RobotHWInterfaceBase::updateInterfaceStateFromRobot()
+  │     ├── CentroidalMpcMrtJointController::computeJointControlAction()
+  │     │     ├── updateMpcObservation() -> Pinocchio centroidal momentum
+  │     │     ├── mcpMrtInterface_.evaluatePolicy()
+  │     │     └── computeJointTorques<scalar_t>() [Pinocchio inverse dynamics]
+  │     ├── RobotHWInterfaceBase::applyJointAction()
+  │     └── Ros2ProceduralMpcMotionManager::spin_some()
+  │
+  ├── MPC Solver Thread (50-100 Hz):
+  │     └── SqpMpc::advance() [solves centroidal QP subproblems]
+  │
+  ├── Dedicated Physics Thread (2000 Hz, dt = 0.0005 s):
+  │     └── MujocoSimInterface::simulationLoop() -> mj_step(mjModel, mjData)
+  │
+  └── Passive Render Thread (60 Hz):
+        └── MujocoRenderer::launchRenderThread() -> GLFW / OpenGL viewer
+===================================================================================
+```
 
-#include <drake/multibody/plant/multibody_plant.h>
-#include <drake/multibody/parsing/parser.h>
-#include <drake/geometry/scene_graph.h>
-#include <drake/geometry/proximity_properties.h>
-#include <drake/systems/framework/diagram_builder.h>
-#include <drake/systems/analysis/simulator.h>
-#include <drake/math/rigid_transform.h>
-#include <drake/math/rotation_matrix.h>
-#include <drake/multibody/tree/revolute_joint.h>
+#### Why Monolithic Succeeded in MuJoCo:
+1. **Lightweight Physics Compute**: MuJoCo's core stepping function `mj_step` is written in hand-optimized, vectorized C. For the 29-DOF G1 robot with flat ground contact, a single time-step takes only **50–80 $\mu$s**.
+2. **Generous CPU Headroom**: In a 500 $\mu$s interval (2000 Hz), MuJoCo's 50–80 $\mu$s execution consumes less than 16% of a single CPU core. The remaining 420–450 $\mu$s leaves ample margin for OS thread scheduling, even when the OCS2 solver runs concurrently.
+3. **Automatic Actuator Clamping**: MuJoCo's physics engine strictly clamps `mjData->ctrl` to `actuatorfrcrange` at the solver level, preventing transient control errors from causing numerical explosions.
 
-#include <Eigen/Dense>
-#include <mutex>
-#include <vector>
-#include <string>
-#include <cmath>
-#include <algorithm>
+---
 
-namespace drake_mbd  = drake::multibody;
-namespace drake_geo  = drake::geometry;
-namespace drake_sys  = drake::systems;
-namespace drake_math = drake::math;
+### 1.2 Why Transplanting the Monolithic Pattern to Drake Caused Catastrophic Instability
 
-class DrakeSimNode : public rclcpp::Node
-{
-public:
-  DrakeSimNode()
-  : Node("drake_sim_node")
-  {
-    /* ── parameters ─────────────────────────────────────────────── */
-    declare_parameter<std::string>("urdf_path", "");
-    declare_parameter<double>("sim_dt", 0.001);          // [FIX-1] 1 ms discrete
-    declare_parameter<double>("initial_height", 0.78);   // [FIX-3] squat height
-    declare_parameter<double>("max_torque", 300.0);      // [FIX-5] safety clamp
+When this single-process monolithic pattern was replicated in Drake (`drake_mrt_sim_node`), the simulation suffered from immediate robot collapse, violent high-frequency oscillations, and system unresponsiveness. Forensic profiling identified five primary failure mechanisms:
 
-    urdf_path_      = get_parameter("urdf_path").as_string();
-    sim_dt_         = get_parameter("sim_dt").as_double();
-    initial_height_ = get_parameter("initial_height").as_double();
-    max_torque_     = get_parameter("max_torque").as_double();
+| Mechanism | MuJoCo Baseline | Drake Monolithic Replica | Impact on Simulation Stability |
+| :--- | :--- | :--- | :--- |
+| **Physics Step Compute Time** | Vectorized C (`mj_step`): **50–80 $\mu$s** | C++ `MultibodyPlant` + SAP contact solver: **300–450 $\mu$s** | In a 500 $\mu$s interval (2000 Hz), Drake leaves only 50–200 $\mu$s margin. Any thread preemption causes missed deadlines. |
+| **CPU Core Contention (12 Threads)** | Low CPU footprint; threads fit without contention. | OCS2 SQP solver invokes OpenMP & Eigen across all available cores during QP factorizations. | OpenMP solver worker threads preempt Drake's 2000 Hz physics pacing thread and 500 Hz control loop. |
+| **Pacing Jitter & Phase Lag** | Physics thread wakes predictably at 0.5 ms intervals. | Pacing jitter swings from 0.5 ms to 2.5 ms. Control feedback experiences 2–5 ms phase lag. | At $K_p = 1200$, phase lag introduces energy into the system, causing rapid torque chatter and instability. |
+| **Actuator Saturation** | Physics engine clamps input torques to motor torque limits. | Drake's `AddJointActuator` stores `effortLimit` as informational metadata; actuation port does **not** clamp. | Jitter-induced errors caused unclamped torque spikes ($> 500-1200$ N$\cdot$m), blowing up the plant dynamics. |
+| **Internal Collision Pairs** | Explicitly disabled via `contype="0" conaffinity="0"`. | URDF meshes loaded into SceneGraph created **703 self-collision pairs**. | Spurious internal contact penalty forces between adjacent links destabilized the robot mechanism. |
 
-    if (urdf_path_.empty()) {
-      RCLCPP_FATAL(get_logger(), "Parameter 'urdf_path' must be set.");
-      throw std::runtime_error("urdf_path not provided");
-    }
+#### OpenMP Preemption of 2000 Hz Physics:
+On a 12-thread host (Intel Core i5-11400H), when `SqpMpc` solves a sequential quadratic program, OpenMP spawns parallel threads to evaluate dynamics linearizations and factorize QP matrices (HPIPM / qpOASES). In an unpinned monolithic process, these OpenMP threads saturate all 12 CPU cores. When the 2000 Hz physics thread (`std::this_thread::sleep_until(nextWakeup)`) attempts to wake up, the Linux CFS (Completely Fair Scheduler) delays it behind the compute-heavy OpenMP threads. As a result, physics time-steps stall, the robot "hangs" in mid-air, and when the physics thread finally executes, it attempts to catch up with stale joint actions, causing violent impulse shocks.
 
-    /* ── build Drake simulation ─────────────────────────────────── */
-    buildDiagram();
+#### Clarifying the "Legacy Split Pipeline" Trap:
+In early development, a two-node experiment (`drake_sim_node` + `policy_to_command_node`) was attempted. That experiment failed not because ROS 2 decoupling is flawed, but because it utilized an ad-hoc custom bridge streaming raw joint torques over `/drake/joint_torques` at high latency (2–5 ms), had QoS mismatches, and required zeroing base velocities. The production solution is **not** to return to a broken monolithic architecture, but to adopt the standard, battle-tested **2-Node ROS 2 Topic-Based OCS2 Policy Architecture**.
 
-    /* ── ROS interfaces ─────────────────────────────────────────── */
-    joint_state_pub_ = create_publisher<sensor_msgs::msg::JointState>(
-        "/drake/joint_states", 10);
+---
 
-    centroidal_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
-        "/drake/centroidal_state", 10);
+## 2. Clean 2-Node ROS 2 Topic-Based OCS2 Policy Architecture
 
-    torque_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
-        "/drake/joint_torques", 10,
-        [this](std_msgs::msg::Float64MultiArray::SharedPtr m) {
-          std::lock_guard<std::mutex> lk(mu_);
-          if (static_cast<int>(m->data.size()) == n_act_) {
-            cmd_tau_ = Eigen::Map<const Eigen::VectorXd>(m->data.data(), n_act_);
-          }
-        });
+The production architecture cleanly decouples the compute-intensive sequential quadratic programming solver from the real-time Drake physics simulation and control loop across two dedicated processes, adhering strictly to Requirements R1, R2, and R3.
 
-    /* 1 kHz wall-timer drives the sim loop */
-    timer_ = create_wall_timer(std::chrono::microseconds(
-        static_cast<int>(sim_dt_ * 1e6)),
-        std::bind(&DrakeSimNode::stepAndPublish, this));
+```text
+========================================================================================================
+                                     2-NODE DECOUPLED ARCHITECTURE
+========================================================================================================
 
-    RCLCPP_INFO(get_logger(),
-        "DrakeSimNode ready  |  actuators=%d  dt=%.4f  z0=%.2f  mass=%.1f kg",
-        n_act_, sim_dt_, initial_height_, total_mass_);
-    for (int i = 0; i < n_act_; ++i)
-      RCLCPP_INFO(get_logger(), "  act[%2d] = %s", i, act_names_[i].c_str());
-  }
-
-private:
-  /* ================================================================
-   *  BUILD THE DRAKE DIAGRAM
-   * ================================================================ */
-  void buildDiagram()
-  {
-    drake_sys::DiagramBuilder<double> builder;
-
-    // [FIX-1] discrete plant  → implicit time-stepping, stable with contact
-    auto pair = drake_mbd::AddMultibodyPlantSceneGraph(&builder, sim_dt_);
-    plant_  = &pair.plant;
-    sg_     = &pair.scene_graph;
-
-    // [FIX-2] contact solver + model
-    plant_->set_contact_model(
-        drake_mbd::ContactModel::kHydroelasticWithFallback);
-    plant_->set_discrete_contact_solver(
-        drake_mbd::DiscreteContactSolver::kSap);
-
-    // Parse robot URDF / MJCF
-    drake_mbd::Parser parser(plant_);
-    model_ = parser.AddModels(urdf_path_).at(0);
-
-    // [FIX-2] compliant-hydroelastic half-space ground
-    {
-      drake_geo::ProximityProperties gp;
-      drake_geo::AddCompliantHydroelasticProperties(
-          /*resolution_hint=*/0.1, /*hydroelastic_modulus=*/1e7, &gp);
-      drake_mbd::CoulombFriction<double> mu(0.8, 0.6);
-      drake_geo::AddContactMaterial(
-          /*dissipation=*/1.25, /*point_stiffness=*/{}, mu, &gp);
-      plant_->RegisterCollisionGeometry(
-          plant_->world_body(), drake_math::RigidTransformd(),
-          drake_geo::HalfSpace(), "ground_collision", gp);
-      plant_->RegisterVisualGeometry(
-          plant_->world_body(), drake_math::RigidTransformd(),
-          drake_geo::HalfSpace(), "ground_visual",
-          drake::Vector4d(0.5, 0.5, 0.5, 1.0));
-    }
-
-    plant_->Finalize();
-
-    // Cache sizes
-    n_act_ = plant_->num_actuators();
-    n_q_   = plant_->num_positions();
-    n_v_   = plant_->num_velocities();
-
-    // Collect actuator (joint) names in Drake's actuator index order
-    act_names_.reserve(n_act_);
-    for (drake_mbd::JointActuatorIndex j(0); j < n_act_; ++j)
-      act_names_.push_back(plant_->get_joint_actuator(j).joint().name());
-
-    // Build & create simulator
-    diagram_   = builder.Build();
-    simulator_ = std::make_unique<drake_sys::Simulator<double>>(*diagram_);
-    simulator_->set_target_realtime_rate(1.0);
-
-    // [FIX-3] set initial state – bent-knee standing
-    setInitialState();
-
-    // Cache total mass (needed for centroidal momentum normalisation)
-    {
-      const auto& pc = diagram_->GetSubsystemContext(*plant_,
-                                                      simulator_->get_context());
-      total_mass_ = plant_->CalcTotalMass(pc);
-    }
-
-    cmd_tau_ = Eigen::VectorXd::Zero(n_act_);
-    simulator_->Initialize();
-    sim_time_ = 0.0;
-  }
-
-  /* ================================================================
-   *  INITIAL STATE  – bent-knee squat at z = initial_height_
-   * ================================================================ */
-  void setInitialState()                                      // [FIX-3]
-  {
-    auto& ctx  = simulator_->get_mutable_context();
-    auto& pc   = diagram_->GetMutableSubsystemContext(*plant_, &ctx);
-    const auto& pelvis = plant_->GetBodyByName("pelvis");
-
-    // Floating-base pose
-    plant_->SetFreeBodyPose(&pc, pelvis,
-        drake_math::RigidTransformd(
-            drake_math::RotationMatrixd::Identity(),
-            Eigen::Vector3d(0, 0, initial_height_)));
-
-    drake_mbd::SpatialVelocity<double> v0;
-    v0.SetZero();
-    plant_->SetFreeBodySpatialVelocity(&pc, pelvis, v0);
-
-    // Joint positions – bent-knee standing
-    for (const auto& nm : act_names_) {
-      double q0 = nominalQ(nm);
-      try {
-        auto& rj = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(
-            plant_->GetJointByName(nm));
-        rj.set_angle(&pc, q0);
-      } catch (...) { /* skip non-revolute */ }
-    }
-
-    // Zero actuation initially
-    plant_->get_actuation_input_port(model_).FixValue(
-        &pc, Eigen::VectorXd::Zero(n_act_));
-  }
-
-  static double nominalQ(const std::string& n)
-  {
-    if (n.find("hip_pitch")   != std::string::npos) return -0.2;
-    if (n.find("knee")        != std::string::npos) return  0.4;
-    if (n.find("ankle_pitch") != std::string::npos) return -0.2;
-    return 0.0;
-  }
-
-  /* ================================================================
-   *  SIMULATION STEP  +  PUBLISH
-   * ================================================================ */
-  void stepAndPublish()
-  {
-    /* apply torques ------------------------------------------------ */
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      auto& ctx = simulator_->get_mutable_context();
-      auto& pc  = diagram_->GetMutableSubsystemContext(*plant_, &ctx);
-
-      Eigen::VectorXd tau = cmd_tau_;
-      tau = tau.cwiseMax(-max_torque_).cwiseMin(max_torque_);   // [FIX-5]
-      plant_->get_actuation_input_port(model_).FixValue(&pc, tau);
-    }
-
-    /* advance simulation ------------------------------------------ */
-    sim_time_ += sim_dt_;
-    try {
-      simulator_->AdvanceTo(sim_time_);
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-          "Drake step failed: %s", e.what());
-      return;
-    }
-
-    const auto& ctx = simulator_->get_context();
-    const auto& pc  = diagram_->GetSubsystemContext(*plant_, ctx);
-
-    /* publish JointState ------------------------------------------ */
-    {
-      sensor_msgs::msg::JointState js;
-      js.header.stamp = now();
-      js.name         = act_names_;
-      js.position.resize(n_act_);
-      js.velocity.resize(n_act_);
-      js.effort.resize(n_act_, 0.0);
-      for (int i = 0; i < n_act_; ++i) {
-        try {
-          auto& rj = dynamic_cast<const drake_mbd::RevoluteJoint<double>&>(
-              plant_->GetJointByName(act_names_[i]));
-          js.position[i] = rj.get_angle(pc);
-          js.velocity[i] = rj.get_angular_rate(pc);
-        } catch (...) {
-          js.position[i] = 0;
-          js.velocity[i] = 0;
-        }
-      }
-      joint_state_pub_->publish(js);
-    }
-
-    /* publish centroidal state ------------------------------------ */
-    // Layout: [h_com_lin(3), h_com_ang(3), base_pos(3), euler_ZYX(3)]
-    {                                                          // [FIX-4]
-      const auto& pelvis = plant_->GetBodyByName("pelvis");
-      auto X  = plant_->EvalBodyPoseInWorld(pc, pelvis);
-      auto V  = plant_->EvalBodySpatialVelocityInWorld(pc, pelvis);
-
-      // Base position
-      Eigen::Vector3d p = X.translation();
-
-      // ZYX Euler angles  (yaw, pitch, roll)
-      Eigen::Matrix3d R = X.rotation().matrix();
-      double yaw   = std::atan2(R(1,0), R(0,0));
-      double pitch = std::asin(std::clamp(-R(2,0), -1.0, 1.0));
-      double roll  = std::atan2(R(2,1), R(2,2));
-
-      // Normalised centroidal momentum
-      //   h_linear  = v_CoM             (= linear_momentum  / m)
-      //   h_angular = L_CoM / m         (= angular_momentum / m)
-      Eigen::Vector3d v_com = V.translational();   // approx v_CoM
-      Eigen::Vector3d h_ang = V.rotational();       // rough approx
-      try {
-        v_com = plant_->CalcCenterOfMassTranslationalVelocityInWorld(pc);
-      } catch (...) {}
-      try {
-        Eigen::Vector3d p_com =
-            plant_->CalcCenterOfMassPositionInWorld(pc);
-        auto L = plant_->CalcSpatialMomentumInWorldAboutPoint(pc, p_com);
-        h_ang = L.rotational() / total_mass_;
-      } catch (...) {}
-
-      std_msgs::msg::Float64MultiArray cs;
-      cs.data = {
-        v_com.x(), v_com.y(), v_com.z(),     // h_com linear  [0-2]
-        h_ang.x(), h_ang.y(), h_ang.z(),     // h_com angular [3-5]
-        p.x(),     p.y(),     p.z(),         // base pos      [6-8]
-        yaw,       pitch,     roll           // euler ZYX     [9-11]
-      };
-      centroidal_pub_->publish(cs);
-    }
-  }
-
-  /* ── members ────────────────────────────────────────────────────── */
-  drake_mbd::MultibodyPlant<double>*  plant_{};
-  drake_geo::SceneGraph<double>*      sg_{};
-  drake_mbd::ModelInstanceIndex       model_;
-  std::unique_ptr<drake_sys::Diagram<double>>    diagram_;
-  std::unique_ptr<drake_sys::Simulator<double>>  simulator_;
-
-  double sim_time_{0}, sim_dt_{0.001}, initial_height_{0.78};
-  double total_mass_{35}, max_torque_{300};
-  int    n_act_{0}, n_q_{0}, n_v_{0};
-  std::string urdf_path_;
-
-  std::vector<std::string> act_names_;
-  Eigen::VectorXd          cmd_tau_;
-  std::mutex               mu_;
-
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr       joint_state_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr   centroidal_pub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr torque_sub_;
-  rclcpp::TimerBase::SharedPtr timer_;
-};
-
-/* ================================================================== */
-int main(int argc, char** argv)
-{
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<DrakeSimNode>());
-  rclcpp::shutdown();
-  return 0;
-}
+                                   CORES 0-4 (taskset -c 0-4)
+                      ┌──────────────────────────────────────────────────┐
+                      │          Node 1: MPC Policy Publisher            │
+                      │       (humanoid_centroidal_mpc_sqp_node)         │
+                      │                                                  │
+                      │  • CentroidalMpcInterface                        │
+                      │  • SqpMpc (Centroidal SQP Solver)                │
+                      │  • Ros2ProceduralMpcMotionManager                │
+                      │  • CentroidalMpcTargetTrajectoriesCalculator     │
+                      │  • MPC_ROS_Interface                             │
+                      └─────────▲───────────────┬────────────────▲───────┘
+                                │               │                │
+             /g1/mpc_observation│               │/g1/mpc_policy  │/g1/mpc_reset (Service)
+             (MpcObservation)   │               │(MpcFlattened)  │(Reset.srv)
+             [QoS: Best Effort] │               │[Best Effort]   │
+                                │               │                │
+                      ┌─────────┴───────────────▼────────────────┴───────┐
+                      │          Node 2: Drake MRT Simulator             │
+                      │              (drake_mrt_sim_node)                │
+                      │                                                  │
+                      │  • MRT_ROS_Interface (OCS2 Policy unpacker)     │
+                      │  • 500 Hz MRT Follower Loop                      │
+                      │    - Pinocchio inverse dynamics (computeTorques) │
+                      │    - Centroidal momentum observation generator   │
+                      │  • 2000 Hz DrakeSimInterface (Discrete SAP)      │
+                      │    - Dedicated physics thread (dt = 0.5 ms)      │
+                      │    - In-memory PD: tau = tau_ff + Kp*e + Kd*ed   │
+                      │    - Strict Torque Clamping: |tau| <= max_effort │
+                      │  • 60 Hz Decoupled Meshcat Visualizer            │
+                      └─────────────────────────┬────────────────────────┘
+                                   CORES 5-9 (taskset -c 5-9)
+                                                │
+                                                │ /humanoid/walking_velocity_command
+                                                │ (WalkingVelocityCommand)
+                                                │
+                      ┌─────────────────────────┴────────────────────────┐
+                      │               Cores 10-11 (Uncontended)          │
+                      │  • base_velocity_controller_gui (25 Hz Tkinter)  │
+                      │  • Meshcat Browser Session (localhost:7000)      │
+                      │  • OS / Window Manager / Desktop Shell           │
+                      └──────────────────────────────────────────────────┘
+========================================================================================================
 ```
 
 ---
 
-## Corrected `policy_to_command_node.cpp`
-
-```cpp
-///////////////////////////////////////////////////////////////////////////////
-// policy_to_command_node.cpp
-//
-// Bridge between the OCS2 centroidal MPC and the Drake simulation.
-//
-// Subscribes:
-//   /drake/joint_states      (JointState)               — from Drake
-//   /drake/centroidal_state  (Float64MultiArray)         — from Drake
-//   /g1/mpc_policy           (MpcFlattenedController)    — from MPC  ★ BEST_EFFORT
-//
-// Publishes:
-//   /g1/mpc_observation      (MpcObservation)            — to MPC
-//   /drake/joint_torques     (Float64MultiArray)         — to Drake
-//
-// Calls at startup:
-//   /g1/mpc_reset            (ocs2_msgs/srv/Reset)       — reset MPC solver
-//
-// Bug fixes vs. original:
-//   [FIX-A] QoS for /g1/mpc_policy subscriber → best_effort()  (was reliable)
-//   [FIX-B] MPC state vector layout → [h(6),pos(3),eulerZYX(3),q(23)]
-//   [FIX-C] Name-based joint mapping between Drake actuator order and MPC order
-//   [FIX-D] Nominal bent-knee hold pose  (was all-zeros → collapse)
-//   [FIX-E] MPC reset via service call   (was pulsing reset_solver flag)
-//   [FIX-F] Correct extraction of q_des from state_trajectory (indices 12-34)
-//           and v_des / u_ff from input_trajectory (indices 12-34)
-//   [FIX-G] Observation time = elapsed wall-time from start
-//   [FIX-H] Hold controller with stiff PD (gravity compensation via high gains)
-///////////////////////////////////////////////////////////////////////////////
-
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
-
-// ── OCS2 messages ──────────────────────────────────────────────────
-// If using manumerous/ocs2_ros2 fork, change ocs2_msgs → ocs2_ros2_msgs
-#include <ocs2_msgs/msg/mpc_flattened_controller.hpp>
-#include <ocs2_msgs/msg/mpc_observation.hpp>
-#include <ocs2_msgs/srv/reset.hpp>
-
-#include <Eigen/Dense>
-#include <mutex>
-#include <vector>
-#include <string>
-#include <map>
-#include <cmath>
-#include <chrono>
-#include <algorithm>
-
-using MpcPolicy = ocs2_msgs::msg::MpcFlattenedController;
-using MpcObs    = ocs2_msgs::msg::MpcObservation;
-using ResetSrv  = ocs2_msgs::srv::Reset;
-
-class PolicyToCommandNode : public rclcpp::Node
-{
-public:
-  PolicyToCommandNode()
-  : Node("policy_to_command_node")
-  {
-    /* ── parameters ──────────────────────────────────────────────── */
-    declare_parameter<double>("hold_duration_s", 3.0);
-    declare_parameter<double>("control_rate_hz", 500.0);
-    declare_parameter<int>   ("obs_decimation",  5);
-
-    hold_duration_  = get_parameter("hold_duration_s").as_double();
-    control_rate_   = get_parameter("control_rate_hz").as_double();
-    obs_decimation_ = get_parameter("obs_decimation").as_int();
-
-    /* ── MPC joint names  (Pinocchio depth-first order) ──────────── */
-    //  23 active joints  =  12 leg  +  3 waist  +  4 L-arm  +  4 R-arm
-    //  This MUST match the ordering in the MPC's URDF (wrists removed).
-    mpc_names_ = {
-      // ─ left leg ─
-      "left_hip_pitch_joint",   "left_hip_roll_joint",
-      "left_hip_yaw_joint",     "left_knee_joint",
-      "left_ankle_pitch_joint", "left_ankle_roll_joint",
-      // ─ right leg ─
-      "right_hip_pitch_joint",  "right_hip_roll_joint",
-      "right_hip_yaw_joint",    "right_knee_joint",
-      "right_ankle_pitch_joint","right_ankle_roll_joint",
-      // ─ waist ─
-      "waist_yaw_joint",  "waist_roll_joint",  "waist_pitch_joint",
-      // ─ left arm ─
-      "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
-      "left_shoulder_yaw_joint",   "left_elbow_joint",
-      // ─ right arm ─
-      "right_shoulder_pitch_joint","right_shoulder_roll_joint",
-      "right_shoulder_yaw_joint",  "right_elbow_joint"
-    };
-    n_mpc_ = static_cast<int>(mpc_names_.size());  // must be 23
-
-    /* ── nominal pose + PD gains ─────────────────────────────────── */
-    q_nom_.setZero(n_mpc_);   // [FIX-D]
-    kp_hold_.setZero(n_mpc_); kd_hold_.setZero(n_mpc_);
-    kp_track_.setZero(n_mpc_); kd_track_.setZero(n_mpc_);
-    for (int i = 0; i < n_mpc_; ++i) {
-      const auto& nm = mpc_names_[i];
-      q_nom_[i]     = nomQ(nm);
-      kp_hold_[i]   = holdKp(nm);   kd_hold_[i]   = holdKd(nm);
-      kp_track_[i]  = trackKp(nm);  kd_track_[i]  = trackKd(nm);
-    }
-
-    /* ── state bookkeeping ───────────────────────────────────────── */
-    q_meas_.setZero(n_mpc_);
-    v_meas_.setZero(n_mpc_);
-    cent_state_.setZero(12);
-    policy_received_ = false;
-    joints_received_ = false;
-    mapping_built_   = false;
-
-    /* ── ROS interfaces ──────────────────────────────────────────── */
-
-    // Drake joint states (reliable, depth 10)
-    js_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-        "/drake/joint_states", 10,
-        std::bind(&PolicyToCommandNode::jointStateCb, this,
-                  std::placeholders::_1));
-
-    // Drake centroidal state (reliable, depth 10)
-    cent_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
-        "/drake/centroidal_state", 10,
-        [this](std_msgs::msg::Float64MultiArray::SharedPtr m) {
-          std::lock_guard<std::mutex> lk(mu_);
-          if (m->data.size() >= 12)
-            cent_state_ = Eigen::Map<const Eigen::VectorXd>(
-                              m->data.data(), 12);
-        });
-
-    // ★ [FIX-A] MPC policy subscriber — BEST-EFFORT to match MPC publisher
-    {
-      auto qos = rclcpp::QoS(1);
-      qos.best_effort();                                      // ★ critical fix
-      policy_sub_ = create_subscription<MpcPolicy>(
-          "/g1/mpc_policy", qos,
-          std::bind(&PolicyToCommandNode::policyCb, this,
-                    std::placeholders::_1));
-    }
-
-    // MPC observation publisher (reliable, depth 1 — matches MPC subscriber)
-    obs_pub_ = create_publisher<MpcObs>("/g1/mpc_observation",
-                                         rclcpp::QoS(1));
-
-    // Drake torque commands
-    tau_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
-        "/drake/joint_torques", 10);
-
-    // [FIX-E] MPC reset via service client (NOT reset_solver flag)
-    reset_client_ = create_client<ResetSrv>("/g1/mpc_reset");
-
-    /* ── control timer ───────────────────────────────────────────── */
-    int period_us = static_cast<int>(1e6 / control_rate_);
-    ctrl_timer_ = create_wall_timer(
-        std::chrono::microseconds(period_us),
-        std::bind(&PolicyToCommandNode::controlLoop, this));
-
-    start_time_ = now();
-    tick_ = 0;
-
-    RCLCPP_INFO(get_logger(),
-        "PolicyToCommandNode ready | joints=%d  hold=%.1fs  rate=%.0fHz",
-        n_mpc_, hold_duration_, control_rate_);
-
-    // Delayed MPC reset call (wait for MPC node to be up)
-    reset_timer_ = create_wall_timer(
-        std::chrono::milliseconds(3000),                      // [FIX-E]
-        [this]() {
-          callMpcReset();
-          reset_timer_->cancel();
-        });
-  }
-
-private:
-  /* ================================================================
-   *  NOMINAL POSE  (bent knees at z ≈ 0.78 m)
-   * ================================================================ */
-  static double nomQ(const std::string& n)                    // [FIX-D]
-  {
-    if (n.find("hip_pitch")   != std::string::npos) return -0.20;
-    if (n.find("knee")        != std::string::npos) return  0.40;
-    if (n.find("ankle_pitch") != std::string::npos) return -0.20;
-    return 0.0;
-  }
-
-  /* ================================================================
-   *  PD GAINS
-   * ================================================================ */
-
-  // Hold gains – stiff PD that fights gravity (acts as gravity comp)   [FIX-H]
-  static double holdKp(const std::string& n) {
-    if (n.find("hip_pitch")   != std::string::npos) return 200;
-    if (n.find("hip_roll")    != std::string::npos) return 200;
-    if (n.find("hip_yaw")     != std::string::npos) return 100;
-    if (n.find("knee")        != std::string::npos) return 300;
-    if (n.find("ankle")       != std::string::npos) return  80;
-    if (n.find("waist")       != std::string::npos) return 200;
-    if (n.find("shoulder")    != std::string::npos) return 100;
-    if (n.find("elbow")       != std::string::npos) return  60;
-    return 100;
-  }
-  static double holdKd(const std::string& n) {
-    if (n.find("knee")  != std::string::npos) return 8;
-    if (n.find("hip")   != std::string::npos) return 6;
-    if (n.find("ankle") != std::string::npos) return 4;
-    return 4;
-  }
-
-  // Tracking gains – compliant PD for MPC tracking
-  static double trackKp(const std::string& n) {
-    if (n.find("hip_pitch")   != std::string::npos) return 150;
-    if (n.find("hip_roll")    != std::string::npos) return 150;
-    if (n.find("hip_yaw")     != std::string::npos) return  80;
-    if (n.find("knee")        != std::string::npos) return 200;
-    if (n.find("ankle")       != std::string::npos) return  40;
-    if (n.find("waist")       != std::string::npos) return 150;
-    if (n.find("shoulder")    != std::string::npos) return  80;
-    if (n.find("elbow")       != std::string::npos) return  40;
-    return 80;
-  }
-  static double trackKd(const std::string& n) {
-    if (n.find("knee")  != std::string::npos) return 5;
-    if (n.find("hip")   != std::string::npos) return 4;
-    if (n.find("ankle") != std::string::npos) return 2;
-    return 3;
-  }
-
-  /* ================================================================
-   *  JOINT-STATE CALLBACK  ──  build name-based mapping on first msg
-   * ================================================================ */
-  void jointStateCb(sensor_msgs::msg::JointState::SharedPtr msg)
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-
-    // [FIX-C] one-time: build Drake→MPC index map by joint name
-    if (!mapping_built_ && !msg->name.empty()) {
-      n_drake_ = static_cast<int>(msg->name.size());
-      drake_names_ = msg->name;
-
-      // mpc_to_drake_[mpc_idx] = drake_idx  (or -1 if not found)
-      mpc_to_drake_.assign(n_mpc_, -1);
-      for (int mi = 0; mi < n_mpc_; ++mi) {
-        for (int di = 0; di < n_drake_; ++di) {
-          if (mpc_names_[mi] == drake_names_[di]) {
-            mpc_to_drake_[mi] = di;
-            break;
-          }
-        }
-        if (mpc_to_drake_[mi] < 0)
-          RCLCPP_WARN(get_logger(),
-              "MPC joint '%s' not found in Drake!", mpc_names_[mi].c_str());
-      }
-      mapping_built_ = true;
-      RCLCPP_INFO(get_logger(),
-          "Joint mapping built: %d MPC joints ↔ %d Drake actuators",
-          n_mpc_, n_drake_);
-    }
-
-    if (!mapping_built_) return;
-
-    // Read measured joint state in MPC order
-    for (int mi = 0; mi < n_mpc_; ++mi) {
-      int di = mpc_to_drake_[mi];
-      if (di >= 0 && di < static_cast<int>(msg->position.size())) {
-        q_meas_[mi] = msg->position[di];
-        v_meas_[mi] = (di < static_cast<int>(msg->velocity.size()))
-                        ? msg->velocity[di] : 0.0;
-      }
-    }
-    joints_received_ = true;
-  }
-
-  /* ================================================================
-   *  MPC POLICY CALLBACK
-   * ================================================================ */
-  void policyCb(MpcPolicy::SharedPtr msg)                     // [FIX-A]
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-
-    if (msg->time_trajectory.empty() ||
-        msg->state_trajectory.empty() ||
-        msg->input_trajectory.empty()) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "Received empty MPC policy");
-      return;
-    }
-
-    // [FIX-F] Extract desired state & input at the FIRST trajectory point
-    const auto& x0 = msg->state_trajectory[0].value;   // 35 elems
-    const auto& u0 = msg->input_trajectory[0].value;    // 35 elems
-
-    const int STATE_DIM = 6 + 3 + 3 + n_mpc_;   // 35
-    const int INPUT_DIM = 12 + n_mpc_;           // 35
-
-    if (static_cast<int>(x0.size()) < STATE_DIM ||
-        static_cast<int>(u0.size()) < INPUT_DIM) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "Policy dimensions wrong: state=%zu input=%zu (expect %d,%d)",
-          x0.size(), u0.size(), STATE_DIM, INPUT_DIM);
-      return;
-    }
-
-    // Desired joint positions = state_trajectory[0][12..34]
-    for (int i = 0; i < n_mpc_; ++i)
-      q_des_[i] = x0[12 + i];
-
-    // Feedforward from input_trajectory[0][12..34]
-    // NOTE: In the OCS2 centroidal model these are joint VELOCITIES
-    //       (the MPC decision variables). They serve as velocity
-    //       references in the tracking PD.  If your specific
-    //       wb_humanoid_mpc converts them to torques internally,
-    //       they can also be used as feedforward torques.
-    for (int i = 0; i < n_mpc_; ++i)
-      u_ff_[i] = u0[12 + i];
-
-    policy_time_ = msg->time_trajectory[0];
-    policy_received_ = true;
-    last_policy_stamp_ = now();
-  }
-
-  /* ================================================================
-   *  MPC RESET SERVICE CALL
-   * ================================================================ */
-  void callMpcReset()                                         // [FIX-E]
-  {
-    if (!reset_client_->wait_for_service(std::chrono::seconds(2))) {
-      RCLCPP_WARN(get_logger(),
-          "MPC reset service not available – will retry on next timer");
-      return;
-    }
-
-    auto req = std::make_shared<ResetSrv::Request>();
-    // The Reset service request contains MpcTargetTrajectories.
-    // For initial reset, send the current nominal state as target.
-    // (The exact fields depend on the ocs2_msgs version.)
-    // Most implementations accept an empty request for default reset.
-
-    auto future = reset_client_->async_send_request(req);
-    RCLCPP_INFO(get_logger(), "MPC reset service called");
-  }
-
-  /* ================================================================
-   *  MAIN CONTROL LOOP  (runs at control_rate_ Hz)
-   * ================================================================ */
-  void controlLoop()
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-
-    if (!joints_received_ || !mapping_built_) return;
-
-    double elapsed = (now() - start_time_).seconds();         // [FIX-G]
-    bool in_hold = (elapsed < hold_duration_);
-
-    Eigen::VectorXd tau_mpc(n_mpc_);
-
-    if (in_hold || !policy_received_) {
-      /* ── HOLD PHASE ─────────────────────────────────────────────
-       * Stiff PD to nominal pose.  High gains act as implicit
-       * gravity compensation – no separate g(q) computation needed.
-       * ─────────────────────────────────────────────────────────── */
-      for (int i = 0; i < n_mpc_; ++i)                       // [FIX-H]
-        tau_mpc[i] = kp_hold_[i] * (q_nom_[i] - q_meas_[i])
-                   + kd_hold_[i] * (       0.0 - v_meas_[i]);
-
-    } else {
-      /* ── MPC TRACKING PHASE ─────────────────────────────────────
-       * τ = u_ff  +  Kp·(q_des − q)  +  Kd·(0 − v)
-       *
-       * u_ff comes from input_trajectory[0][12:34].
-       * In the standard centroidal model these are joint velocities
-       * (small magnitude, ~0–1 rad/s) which effectively add a small
-       * velocity-proportional feedforward.  If your MPC variant
-       * converts them to torques, they provide meaningful feedforward.
-       *
-       * q_des comes from state_trajectory[0][12:34].
-       * ─────────────────────────────────────────────────────────── */
-      for (int i = 0; i < n_mpc_; ++i)                       // [FIX-F]
-        tau_mpc[i] = u_ff_[i]
-                   + kp_track_[i] * (q_des_[i] - q_meas_[i])
-                   + kd_track_[i] * (      0.0 - v_meas_[i]);
-    }
-
-    /* ── Map MPC-order torques → Drake actuator order ────────────── */
-    Eigen::VectorXd tau_drake = Eigen::VectorXd::Zero(n_drake_);
-    for (int mi = 0; mi < n_mpc_; ++mi) {                    // [FIX-C]
-      int di = mpc_to_drake_[mi];
-      if (di >= 0 && di < n_drake_)
-        tau_drake[di] = tau_mpc[mi];
-    }
-
-    /* publish torques to Drake ------------------------------------ */
-    {
-      std_msgs::msg::Float64MultiArray msg;
-      msg.data.assign(tau_drake.data(),
-                      tau_drake.data() + tau_drake.size());
-      tau_pub_->publish(msg);
-    }
-
-    /* ── publish MPC observation every obs_decimation_ ticks ─────── */
-    if (++tick_ % obs_decimation_ == 0)
-      publishObservation(elapsed);
-  }
-
-  /* ================================================================
-   *  PUBLISH MPC OBSERVATION
-   * ================================================================ */
-  void publishObservation(double elapsed)
-  {
-    MpcObs obs;
-    obs.time = elapsed;                                       // [FIX-G]
-
-    /* ── state vector ──────────────────────────────────────────────
-     * Layout:  [h_com_lin(3), h_com_ang(3),                   0-5
-     *           base_x, base_y, base_z,                       6-8
-     *           euler_z(yaw), euler_y(pitch), euler_x(roll),  9-11
-     *           q_j0 … q_j22]                               12-34
-     * Total = 35
-     * ────────────────────────────────────────────────────────── */
-    const int STATE_DIM = 12 + n_mpc_;                        // [FIX-B]
-    obs.state.value.resize(STATE_DIM);
-
-    // First 12 elements come from Drake centroidal_state publication
-    for (int i = 0; i < 12 && i < static_cast<int>(cent_state_.size()); ++i)
-      obs.state.value[i] = cent_state_[i];
-
-    // Joint positions in MPC order (indices 12..34)
-    for (int i = 0; i < n_mpc_; ++i)
-      obs.state.value[12 + i] = q_meas_[i];
-
-    /* ── input vector  (set to zero — MPC uses state as main input) */
-    const int INPUT_DIM = 12 + n_mpc_;
-    obs.input.value.assign(INPUT_DIM, 0.0);
-
-    /* ── mode  (contact mode bitmask) ─────────────────────────────
-     * For 6-DoF contacts with 2 feet:  mode 3 = both feet in contact.
-     * For 3-DoF contacts with 4 points: mode 15 = all 4 contacts.
-     * Adjust to match your MPC's contact schedule definition.       */
-    obs.mode = 3;   // dual-support  (binary 11 for 2 contacts)
-
-    obs_pub_->publish(obs);
-  }
-
-  /* ── members ────────────────────────────────────────────────────── */
-  int n_mpc_{23};
-  int n_drake_{0};
-  double hold_duration_{3.0};
-  double control_rate_{500.0};
-  int obs_decimation_{5};
-
-  std::vector<std::string> mpc_names_;
-  std::vector<std::string> drake_names_;
-  std::vector<int>         mpc_to_drake_;    // [FIX-C] index map
-  bool mapping_built_{false};
-
-  Eigen::VectorXd q_nom_;
-  Eigen::VectorXd kp_hold_, kd_hold_;
-  Eigen::VectorXd kp_track_, kd_track_;
-
-  Eigen::VectorXd q_meas_, v_meas_;
-  Eigen::VectorXd cent_state_;               // first 12 of MPC state
-
-  // Latest MPC policy data (in MPC joint order)
-  Eigen::VectorXd q_des_  = Eigen::VectorXd::Zero(23);
-  Eigen::VectorXd u_ff_   = Eigen::VectorXd::Zero(23);
-  double          policy_time_{0};
-  bool            policy_received_{false};
-  bool            joints_received_{false};
-  rclcpp::Time    last_policy_stamp_;
-  rclcpp::Time    start_time_;
-  int             tick_{0};
-
-  std::mutex mu_;
-
-  // ROS interfaces
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr     js_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr cent_sub_;
-  rclcpp::Subscription<MpcPolicy>::SharedPtr                        policy_sub_;
-  rclcpp::Publisher<MpcObs>::SharedPtr                              obs_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr    tau_pub_;
-  rclcpp::Client<ResetSrv>::SharedPtr                               reset_client_;
-  rclcpp::TimerBase::SharedPtr ctrl_timer_;
-  rclcpp::TimerBase::SharedPtr reset_timer_;
-};
-
-/* ==================================================================== */
-int main(int argc, char** argv)
-{
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<PolicyToCommandNode>());
-  rclcpp::shutdown();
-  return 0;
-}
-```
+### 2.1 Node 1 Specification: OCS2 Policy Publisher (`humanoid_centroidal_mpc_sqp_node`)
+- **Package**: `humanoid_centroidal_mpc_ros2` (Strictly unmodified per R3).
+- **Executable**: `humanoid_centroidal_mpc_sqp_node`.
+- **CPU Pinning**: Cores `0-4` (`taskset -c 0-4`).
+- **Core Responsibilities**:
+  1. Instantiates `CentroidalMpcInterface` to parse robot kinematics, costs, and constraints.
+  2. Executes `SqpMpc` to solve the centroidal optimal control problem over a 1.0 s planning horizon.
+  3. `Ros2ProceduralMpcMotionManager` subscribes to `/humanoid/walking_velocity_command`, scales commands, updates gait schedules (`stance` $\rightarrow$ `slow_walk` $\rightarrow$ `walk`), and modifies target reference trajectories before each solve.
+  4. `MPC_ROS_Interface` manages ROS 2 communication:
+     - Subscribes to `/g1/mpc_observation` (`ocs2_ros2_msgs/msg/MpcObservation`).
+     - Publishes `/g1/mpc_policy` (`ocs2_ros2_msgs/msg/MpcFlattenedController`).
+     - Hosts `/g1/mpc_reset` (`ocs2_ros2_msgs/srv/Reset`).
 
 ---
 
-## Corrected `drake_sim.launch.py`
+### 2.2 Node 2 Specification: Drake MRT Policy Follower & Simulator (`drake_mrt_sim_node`)
+- **Package**: `humanoid_drake_sim`.
+- **Executable**: `drake_mrt_sim_node`.
+- **CPU Pinning**: Cores `5-9` (`taskset -c 5-9`).
+- **Core Responsibilities**:
+  1. Instantiates `ocs2::MRT_ROS_Interface mrt(robotName)` to subscribe to `/g1/mpc_policy`, publish `/g1/mpc_observation`, and invoke `/g1/mpc_reset`.
+  2. Controls physics execution via `DrakeSimInterface`:
+     - Paces discrete SAP contact solver at 2000 Hz ($dt = 0.0005$ s) on a dedicated physics thread.
+     - Evaluates in-memory joint PD feedback: $\tau_i = \tau_{\text{ff},i} + 1200(q_{d,i}-q_i) + 10(\dot{q}_{d,i}-\dot{q}_i)$.
+     - Strictly clamps actuator torques to URDF limits: $\tau_i \in [-\tau_{\text{max},i}, \tau_{\text{max},i}]$.
+  3. Main Follower Loop at 500 Hz:
+     - Copies latest `RobotState` snapshot from `DrakeSimInterface`.
+     - Generates `SystemObservation` (calculating centroidal momentum via Pinocchio).
+     - Calls `mrt.setCurrentObservation(observation)` to publish `/g1/mpc_observation`.
+     - Calls `mrt.updatePolicy()` to unflatten latest linear controller gains and feedforward controls.
+     - Evaluates policy at $t_{\text{sim}} + 0.005$ s to obtain target joint states and contact forces.
+     - Evaluates Pinocchio inverse dynamics `computeJointTorques` to generate feedforward torques $\tau_{\text{ff}}$.
+     - Writes `RobotJointAction` to `DrakeSimInterface`.
+  4. Decoupled 60 Hz Meshcat visualizer updating zero-timestep illustration plant.
+
+---
+
+### 2.3 Interface Contracts (Topics & Services)
+
+| Topic / Service | Message Type | QoS | Direction | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| `/g1/mpc_observation` | `ocs2_ros2_msgs/msg/MpcObservation` | Best Effort, Depth 1 | Node 2 $\rightarrow$ Node 1 | State feedback: base pose, base twist, joint positions, joint velocities, centroidal momentum. |
+| `/g1/mpc_policy` | `ocs2_ros2_msgs/msg/MpcFlattenedController` | Best Effort, Depth 1 | Node 1 $\rightarrow$ Node 2 | Flattened feedback gains $K(t)$ and feedforward controls $u_{\text{ff}}(t)$ over MPC horizon. |
+| `/g1/mpc_reset` | `ocs2_ros2_msgs/srv/Reset` | Reliable Service | Node 2 $\rightarrow$ Node 1 | Synchronous reset: re-initializes SQP solver state and resets target trajectories. |
+| `/humanoid/walking_velocity_command` | `humanoid_mpc_msgs/msg/WalkingVelocityCommand` | Best Effort, Depth 25 | GUI $\rightarrow$ Node 1 | Teleop inputs: $v_x$, $v_y$, $\omega_z$, and desired pelvis height $h$. |
+
+---
+
+## 3. Dedicated CPU Core Partitioning via `taskset` (Requirement R2)
+
+### 3.1 Hardware Topology & Allocation
+The target host is an Intel Core i5-11400H with 6 physical cores and 12 logical CPU threads (`0` through `11`). Under heavy concurrent execution, processes are partitioned as follows:
+
+```text
+Cores 0 - 4 (5 threads, 0x1f):   [Node 1: humanoid_centroidal_mpc_sqp_node]
+                                 - OCS2 SQP Solver (SqpMpc)
+                                 - OpenMP parallel threads for QP subproblems
+                                 - Dynamics linearizations & reference management
+
+Cores 5 - 9 (5 threads, 0x3e0):  [Node 2: drake_mrt_sim_node]
+                                 - 2000 Hz Drake MultibodyPlant + SAP Contact Solver
+                                 - 2000 Hz In-memory joint PD feedback loop
+                                 - 500 Hz MRT policy follower & Pinocchio inverse dynamics
+                                 - Meshcat WebSocket server
+
+Cores 10 - 11 (2 threads, 0xc00):[Node 3 & OS: Desktop, GUI & Browser]
+                                 - base_velocity_controller_gui (25 Hz Tkinter)
+                                 - Web browser / WebGL Meshcat visualizer
+                                 - Linux display server, Xorg/Wayland, background daemons
+```
+
+### 3.2 Launch File Configuration (`drake_mrt_sim.launch.py`)
+In `src/wb_humanoid_mpc/robot_models/unitree_g1/g1_centroidal_mpc/launch/drake_mrt_sim.launch.py`:
 
 ```python
-###############################################################################
-# drake_sim.launch.py
-#
-# Launch file for G1 Drake simulation + OCS2 MPC bridge.
-#
-# Starts:
-#   1. drake_sim_node         — physics simulation (immediate)
-#   2. policy_to_command_node — MPC bridge         (delayed 2 s)
-#
-# The MPC node (humanoid_centroidal_mpc_sqp_node) is launched separately
-# via the wb_humanoid_mpc launch system:
-#   make launch-g1-dummy-sim
-# or equivalent ros2 launch command.
-#
-# Bug fixes vs. original:
-#   [FIX-L1] Added TimerAction delay so Drake is up before bridge starts
-#   [FIX-L2] Correct parameter passing (urdf_path, sim_dt, initial_height)
-#   [FIX-L3] Separate executable names for the two nodes
-###############################################################################
+# Node 1: OCS2 Policy Publisher Node (Cores 0-4)
+mpc_node = Node(
+    package="humanoid_centroidal_mpc_ros2",
+    executable="humanoid_centroidal_mpc_sqp_node",
+    name="humanoid_centroidal_mpc_sqp_node",
+    prefix=["taskset -c 0-4"],
+    output="screen",
+    emulate_tty=True,
+    arguments=[
+        LaunchConfiguration("robot_name"),
+        LaunchConfiguration("config_name"),
+        LaunchConfiguration("target_command_file"),
+        LaunchConfiguration("description_name"),
+        LaunchConfiguration("target_gait_file"),
+    ],
+)
 
-import os
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+# Node 2: Drake MRT Follower & Sim Node (Cores 5-9)
+drake_mrt_node = Node(
+    package="humanoid_drake_sim",
+    executable="drake_mrt_sim_node",
+    name="drake_mrt_sim_node",
+    prefix=["taskset -c 5-9"],
+    output="screen",
+    emulate_tty=True,
+    arguments=[
+        LaunchConfiguration("robot_name"),
+        LaunchConfiguration("config_name"),
+        LaunchConfiguration("target_command_file"),
+        LaunchConfiguration("description_name"),
+        LaunchConfiguration("target_gait_file"),
+    ],
+    parameters=[{
+        "sim_dt": 0.0005,
+        "control_rate_hz": 500.0,
+        "joint_damping": 10.0,
+        "ground_static_friction": 2.0,
+        "ground_dynamic_friction": 1.5,
+        "ground_dissipation": 2.0,
+        "ground_point_stiffness": 5.0e4,
+        "force_mujoco_contact_flags": True,
+        "reset_on_fall": True,
+        "fall_z_threshold": 0.2,
+        "reset_cooldown_s": 1.0,
+        "enable_meshcat": True,          # Enabled by default per R5
+        "meshcat_host": "*",
+        "meshcat_publish_rate_hz": 30.0,
+        "verbose": True,
+    }],
+)
+```
 
+### 3.3 Runtime Core Verification
+Verify core pinning while the simulation is running:
+```bash
+# Verify Node 1 is pinned to cores 0-4 (mask 1f)
+taskset -cp $(pgrep -f humanoid_centroidal_mpc_sqp_node)
+# pid <PID>'s current affinity list: 0-4
 
-def generate_launch_description():
-
-    # ── Launch arguments ──────────────────────────────────────────
-    urdf_path_arg = DeclareLaunchArgument(
-        'urdf_path',
-        default_value='',
-        description='Absolute path to the G1 URDF (23-DOF, wrists removed)')
-
-    sim_dt_arg = DeclareLaunchArgument(
-        'sim_dt',
-        default_value='0.001',
-        description='Drake discrete simulation timestep [s]')
-
-    initial_height_arg = DeclareLaunchArgument(
-        'initial_height',
-        default_value='0.78',
-        description='Initial pelvis height above ground [m]')
-
-    hold_duration_arg = DeclareLaunchArgument(
-        'hold_duration_s',
-        default_value='3.0',
-        description='Seconds to hold nominal pose before MPC takes over')
-
-    control_rate_arg = DeclareLaunchArgument(
-        'control_rate_hz',
-        default_value='500.0',
-        description='Tracking controller rate [Hz]')
-
-    # ── Node 1: Drake simulation (starts immediately) ─────────────
-    drake_sim = Node(
-        package='g1_drake_sim',          # adjust to your package name
-        executable='drake_sim_node',
-        name='drake_sim_node',
-        output='screen',
-        parameters=[{
-            'urdf_path':      LaunchConfiguration('urdf_path'),
-            'sim_dt':         LaunchConfiguration('sim_dt'),
-            'initial_height': LaunchConfiguration('initial_height'),
-            'max_torque':     300.0,
-        }],
-    )
-
-    # ── Node 2: MPC ↔ Drake bridge (delayed 2 s for Drake to init) ─
-    bridge = TimerAction(
-        period=2.0,                                           # [FIX-L1]
-        actions=[
-            Node(
-                package='g1_drake_sim',  # adjust to your package name
-                executable='policy_to_command_node',
-                name='policy_to_command_node',
-                output='screen',
-                parameters=[{
-                    'hold_duration_s':  LaunchConfiguration('hold_duration_s'),
-                    'control_rate_hz':  LaunchConfiguration('control_rate_hz'),
-                    'obs_decimation':   5,   # publish obs every 5 ticks → 100 Hz
-                }],
-            )
-        ]
-    )
-
-    return LaunchDescription([
-        urdf_path_arg,
-        sim_dt_arg,
-        initial_height_arg,
-        hold_duration_arg,
-        control_rate_arg,
-        drake_sim,
-        bridge,
-    ])
+# Verify Node 2 is pinned to cores 5-9 (mask 3e0)
+taskset -cp $(pgrep -f drake_mrt_sim_node)
+# pid <PID>'s current affinity list: 5-9
 ```
 
 ---
 
-## How the nine bugs are resolved — summary table
+## 4. Startup & Reset Synchronization Protocol (Squat Prevention)
 
-| # | Bug | Root cause | Fix |
-|---|-----|-----------|-----|
-| 1 | QoS mismatch silently drops all policies | Subscriber uses `rclcpp::QoS(10)` (reliable) but MPC publishes best-effort | `rclcpp::QoS(1).best_effort()` on `/g1/mpc_policy` subscriber |
-| 2 | Joint order mismatch | Drake actuator indices ≠ Pinocchio model indices | Runtime name-based `mpc_to_drake_[]` index map built from first JointState |
-| 3 | Robot collapses at start | Hold pose is all-zeros (straight legs) | Nominal bent-knee pose: hip_pitch=−0.2, knee=0.4, ankle_pitch=−0.2 |
-| 4 | Wrong MPC state vector | Euler order wrong; h_com placement wrong | Layout `[h_com(6), pos(3), euler_ZYX(3), q(23)]` with yaw-pitch-roll |
-| 5 | Reset mechanism fails | Pulsing `reset_solver` flag in observation (field doesn't exist in ROS2 msg) | Call `ocs2_msgs::srv::Reset` service at `/g1/mpc_reset` |
-| 6 | Wrong policy extraction | Misunderstanding of `state_trajectory` / `input_trajectory` contents | `q_des` from `state[12:34]`, `u_ff` from `input[12:34]` |
-| 7 | Simulation instability | Continuous-time plant (`time_step=0`) with contact | Discrete plant at 1 ms + SAP solver + hydroelastic ground |
-| 8 | No gravity compensation during hold | Robot drifts/falls before MPC starts | Stiff PD gains (Kp up to 300) on nominal pose act as implicit gravity comp |
-| 9 | Wrong observation time | Using Drake sim time or absolute epoch time | Elapsed wall-time: `(now() - start_time_).seconds()` |
+### 4.1 Root Cause of the Startup Squat Phenomenon
+In `TargetTrajectoriesCalculatorBase.cpp:114-127`:
+```cpp
+vector4_t TargetTrajectoriesCalculatorBase::filterAndTransformVelCommandToLocal(
+    const vector4_t& commandedVelLocal, const scalar_t& currentEulerZ, scalar_t filterAlpha) const {
+  static vector4_t commVelFiltered = vector4_t::Zero();
 
-## How the centroidal MPC tracking controller actually works
+  commVelFiltered = commVelFiltered * filterAlpha + commandedVelLocal * (1 - filterAlpha);
 
-The OCS2 centroidal model optimizes over state `x = [h_com, base_pose, q_joints]` and input `u = [contact_forces, joint_velocities]`. The **`MpcFlattenedController`** message publishes the raw MPC solution — `state_trajectory` contains desired joint positions at indices 12–34, and `input_trajectory` contains joint velocity references at indices 12–34.
+  vector4_t globalTargetVel = commVelFiltered;
+  globalTargetVel(0) = std::cos(currentEulerZ) * commVelFiltered[0] - std::sin(currentEulerZ) * commVelFiltered[1];
+  globalTargetVel(1) = std::sin(currentEulerZ) * commVelFiltered[0] + std::cos(currentEulerZ) * commVelFiltered[1];
+  return globalTargetVel;
+}
+```
 
-The tracking controller applies **PD control with feedforward**: `τ = u_ff + Kp·(q_des − q) + Kd·(0 − v)`. In a production system you would use `CentroidalModelRbdConversions::computeRbdTorqueFromCentroidalModelPD()` which calls Pinocchio's RNEA to compute proper inverse-dynamics torques from the MPC's desired state, velocities, accelerations, and contact forces. The simpler PD approach used here is sufficient for initial Drake simulation testing and can be upgraded to full RNEA once the communication pipeline is validated.
+- **The Static Filter**: `commVelFiltered` is declared as a `static` local variable, initialized to `(0, 0, 0, 0)`.
+- Index 2 represents pelvis height ($z_{\text{nominal}} = 0.7925$ m).
+- With $\alpha = 0.8$, the filtered height ramps slowly from 0:
+  - Step 1: $0.2 \times 0.7925 = 0.1585$ m
+  - Step 2: $0.8 \times 0.1585 + 0.2 \times 0.7925 = 0.2853$ m
+  - Step 3: $0.3867$ m ... Step 10: $0.707$ m ... Step 25: $0.790$ m
+- **Consequence**: If physics begins stepping with a cold filter, the first 15 MPC policies command the robot to squat down to $0.16–0.50$ m. The robot collapses into the ground and triggers the fall reset threshold ($z < 0.20$ m).
 
-## Startup sequence
+---
 
-1. Launch `drake_sim_node` — robot spawns at z=0.78m in bent-knee pose
-2. After 2 seconds, launch `policy_to_command_node` — begins hold-phase PD control and publishing observations
-3. After 3 seconds, bridge calls `/g1/mpc_reset` service
-4. Start the MPC node separately: `ros2 launch humanoid_centroidal_mpc ...`
-5. MPC receives observations, solves, publishes policies
-6. Bridge receives first policy (now succeeds thanks to best-effort QoS), transitions from hold to MPC tracking
-7. Robot begins walking according to MPC commands
+### 4.2 The Complete 4-Phase Synchronization Protocol
+
+```text
+Sequence Diagram: Startup & Reset Synchronization Protocol
+========================================================================================
+Node 2 (drake_mrt_sim_node)                          Node 1 (humanoid_centroidal_mpc_sqp_node)
+---------------------------                          -----------------------------------------
+[Phase 1: Posture Hold]
+1. Initialize Drake plant at z_spawn = 0.7872 m
+   Apply holding joint PD (Kp=1200, Kd=10, tau_g)
+   Do NOT step physics yet (sim thread held).
+
+[Phase 2: Service Reset]
+2. Call /g1/mpc_reset service ---------------------> Lock resetMutex_
+   Wait for res->done == true <--------------------- SqpMpc::reset()
+                                                     Set resetRequestedEver_ = true
+                                                     Assign nominal TargetTrajectories
+
+[Phase 3: Observation Warm-up Loop]
+3. Loop 25-30 cycles (or until planned z >= 0.78m):
+   Publish /g1/mpc_observation (t=0, x_init) ------> mpcObservationCallback()
+                                                     preSolverRun() executes filter:
+                                                     commVelFiltered[2] -> 0.7925 m
+   Receive /g1/mpc_policy <------------------------- Publishes warm policy (z_ref >= 0.78 m)
+   mrt.updatePolicy()
+   Inspect policy planned height >= 0.78 m
+
+[Phase 4: Physics Stepping Release]
+4. Start 2000 Hz physics simulation thread
+   Start 500 Hz closed-loop MRT follower loop:
+     Evaluate policy at t_sim + 0.005
+     Compute Pinocchio tau_ff
+     DrakeSimInterface in-memory PD
+     Publish /g1/mpc_observation (t_sim, x_meas) --> Solve dynamic walking/standing
+     Update MRT policy <---------------------------- Publishes live policy
+========================================================================================
+```
+
+---
+
+## 5. Drake Physics, Actuation & Ground Contact Mechanics
+
+### 5.1 2000 Hz SAP Contact Solver Configuration
+- **Step Size**: $dt = 0.0005$ s (2000 Hz).
+- **Contact Approximation**: `drake::multibody::DiscreteContactApproximation::kSap`.
+- **Contact Model**: `drake::multibody::ContactModel::kPointContactOnly`.
+- **Physical Parameters**:
+  - `groundPointStiffness`: $5.0 \times 10^4$ N/m (Prevents penetration while avoiding numerical stiffness).
+  - `groundDissipation`: $2.0$ s/m (Normal velocity damping during contact impact).
+  - `groundStaticFriction`: $2.0$ & `groundDynamicFriction`: $1.5$ (Provides high tangential traction matching MuJoCo).
+  - `jointDamping`: $10.0$ N$\cdot$s/rad (Applied to all 29 revolute joints).
+
+### 5.2 Foot Contact Geometry & Collision Filtering
+- **Collision Stripping**: In `g1_29dof_drake.urdf`, all upper-body mesh collisions are stripped. Only 4 contact spheres ($r = 5$ mm) per foot (8 spheres total) are retained on `left_ankle_roll_link` and `right_ankle_roll_link`.
+- **Self-Collision Exclusion**: `DrakeSimInterface::buildPlant()` enforces `CollisionFilterDeclaration::ExcludeWithin` across the entire robot model instance, eliminating all 703 internal collision pairs.
+
+### 5.3 Calibrated Pelvis Spawn Height ($z_{\text{spawn}} = 0.7872$ m)
+- Nominal standing pelvis height in `task.info` is $0.7925$ m.
+- Forward kinematics reveals that at $0.7925$ m, the foot spheres float **$5.3$ mm** above the ground ($z = +0.0053$ m).
+- Calibrated spawn height:
+  $$z_{\text{spawn}} = 0.7925 - 0.0053 = 0.7872\text{ m}$$
+- At $0.7872$ m, foot spheres rest tangentially on the ground at $t = 0$ with zero drop shock.
+
+### 5.4 In-Memory Joint PD Loop & Strict Torque Clamping
+At each 2000 Hz step in `DrakeSimInterface::simulationStep()`:
+$$\tau_i = \text{clamp}\left( \tau_{\text{ff},i} + K_{p,i}(q_{\text{des},i} - q_i) + K_{d,i}(\dot{q}_{\text{des},i} - \dot{q}_i), \; -\tau_{\text{max},i}, \; \tau_{\text{max},i} \right)$$
+- Gains: $K_p = 1200.0$ N$\cdot$m/rad, $K_d = 10.0$ N$\cdot$m$\cdot$s/rad.
+- Clamping limits: $\pm 88$ N$\cdot$m for hips, $\pm 139$ N$\cdot$m for knees, $\pm 50$ N$\cdot$m for ankles.
+
+### 5.5 Pinocchio `computeJointTorques` at 500 Hz
+In the MRT follower control loop, inverse dynamics computes feedforward torques $\tau_{\text{ff}}$:
+1. Inertia matrix $M(q)$ via Composite Rigid Body Algorithm (CRBA).
+2. Non-linear effects $h(q, \dot{q}) = C(q, \dot{q})\dot{q} + g(q)$.
+3. Contact Jacobians $J_L, J_R$ for foot contact frames.
+4. Contact wrench projection: $\tau_{\text{ext}} = J_L^T w_L + J_R^T w_R$.
+5. Solves unactuated floating base acceleration:
+   $$M_{bb} \ddot{q}_b + M_{bj} \ddot{q}_j + h_b - \tau_{\text{ext},b} = 0 \implies \ddot{q}_b = -M_{bb}^{-1} (M_{bj} \ddot{q}_j + h_b - \tau_{\text{ext},b})$$
+6. Actuated joint torques:
+   $$\tau_{\text{ff}} = M_{jb} \ddot{q}_b + M_{jj} \ddot{q}_j + h_j - \tau_{\text{ext},j}$$
+
+---
+
+## 6. Comprehensive Inventory of All Executables & Libraries in `humanoid_drake_sim`
+
+The package builds 1 library (`drake_sim_interface`) and 10 standalone executables:
+
+```text
+Diagnostic Verification Progression:
+  Level 0: [drake_urdf_interface_smoke_test]  --> URDF parsing, 29 actuators, 10-step finite state
+  Stage 1: [kinematic_replay_test]            --> MPC plan replay, Euler angles, joint signs (Physics OFF)
+  Stage 2: [static_equilibrium_check]         --> StaticEquilibriumProblem gate, contact geometry, CoM polygon
+  Stage 3: [gravity_comp_hold_test]           --> Analytical tau_g + PD posture hold + passive damping (Physics ON)
+           [drake_sap_stand_test]             --> Standalone Drake SAP implicit joint PD constraint
+  Stage 4: [policy_playback_test]             --> Single-solve optimal trajectory replay, force sanity check
+  Stage 5: [threaded_closed_loop_test]        --> Multithreaded closed loop, solver overruns vs physics pacing
+  Production: [drake_mrt_sim_node]            --> Production 2-Node Drake MRT Policy Follower & Simulator
+  Legacy:     [drake_sim_node]                --> Legacy standalone simulator (/drake/joint_states)
+              [policy_to_command_node]        --> Legacy bridge node (/drake/joint_torques)
+```
+
+---
+
+### Target 1: `drake_sim_interface` (C++ Library)
+- **Source**: `src/DrakeSimInterface.cpp`, `include/humanoid_drake_sim/DrakeSimInterface.h`.
+- **Purpose**: Reusable C++ hardware interface implementing `model::RobotHWInterfaceBase` for Drake. Houses the 2000 Hz discrete SAP simulation loop, in-memory PD feedback, torque clamping, self-collision exclusion, and decoupled 60 Hz Meshcat visualizer.
+
+### Target 2: `drake_mrt_sim_node` (Production Drake MRT Follower & Sim)
+- **Source**: `src/drake_mrt_sim_node.cpp`.
+- **Purpose**: Production simulator node launched by `drake_mrt_sim.launch.py`. Uses `ocs2::MRT_ROS_Interface` to follow `/g1/mpc_policy`, publishes `/g1/mpc_observation`, evaluates Pinocchio inverse dynamics at 500 Hz, steps Drake physics at 2000 Hz, and serves Meshcat at port 7000.
+- **Execution Command**:
+  ```bash
+  ros2 launch g1_centroidal_mpc drake_mrt_sim.launch.py
+  ```
+
+### Target 3: `drake_urdf_interface_smoke_test` (Level 0 Smoke Test)
+- **Source**: `src/drake_urdf_interface_smoke_test.cpp`.
+- **Purpose**: Validates URDF parsing, discovers all 29 revolute joints as actuators, steps physics forward by 10 intervals (5 ms), and verifies all states are finite numbers (no `NaN` or `Inf`).
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim drake_urdf_interface_smoke_test \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.urdf --meshcat
+  ```
+
+### Target 4: `kinematic_replay_test` (Stage 1 Diagnostic)
+- **Source**: `src/kinematic_replay_test.cpp`.
+- **Purpose**: Replays an OCS2 planned trajectory kinematically in Drake (`dt = 0.0`, physics disabled) to verify coordinate frame alignment, Euler ZYX order, and joint sign conventions.
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim kinematic_replay_test g1 \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/task.info \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/command/reference.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof.urdf \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/gait.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.xml 3 0.5
+  ```
+
+### Target 5: `static_equilibrium_check` (Stage 2 Gate)
+- **Source**: `src/static_equilibrium_check.cpp`.
+- **Purpose**: Solves a `drake::multibody::StaticEquilibriumProblem` over an `AutoDiffXd` plant to verify whether static standing configuration and contact reaction forces exist without stepping physics.
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim static_equilibrium_check \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.xml 0.7872
+  ```
+
+### Target 6: `gravity_comp_hold_test` (Stage 3 Diagnostic)
+- **Source**: `src/gravity_comp_hold_test.cpp`.
+- **Purpose**: Evaluates pure Drake dynamics under analytical gravity compensation plus PD posture hold ($\tau = -\tau_g(q) + K_p(q_{\text{nom}}-q) - K_d \dot{q}$) without MPC. Proves contact parameter stability.
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim gravity_comp_hold_test \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.xml 10.0 0.7872
+  ```
+
+### Target 7: `drake_sap_stand_test` (Benchmark Diagnostic)
+- **Source**: `src/drake_sap_stand_test.cpp`.
+- **Purpose**: Diagnostic benchmark configuring per-joint PD gains directly on actuators using Drake's internal `SapPdControllerConstraint` (implicit spring-damper contact).
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim drake_sap_stand_test
+  ```
+
+### Target 8: `policy_playback_test` (Stage 4 Diagnostic)
+- **Source**: `src/policy_playback_test.cpp`.
+- **Purpose**: Solves OCS2 SQP once, extracts planned trajectories, and replays them open-loop in Drake physics. Validates contact force normalization ($F_z \approx 172$ N per foot for 35 kg robot).
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim policy_playback_test g1 \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/task.info \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/command/reference.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof.urdf \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/gait.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.xml 3.0
+  ```
+
+### Target 9: `threaded_closed_loop_test` (Stage 5 Diagnostic)
+- **Source**: `src/threaded_closed_loop_test.cpp`.
+- **Purpose**: Threaded closed-loop diagnostic isolating SQP solver compute spikes from physics pacing. Confirms that solver overruns do not stall 2000 Hz physics integration.
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim threaded_closed_loop_test g1 \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/task.info \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/command/reference.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof.urdf \
+    $(ros2 pkg prefix g1_centroidal_mpc)/share/g1_centroidal_mpc/config/mpc/gait.info \
+    $(ros2 pkg prefix g1_description)/share/g1_description/urdf/g1_29dof_drake.xml
+  ```
+
+### Target 10: `drake_sim_node` (Legacy Standalone Simulator)
+- **Source**: `src/drake_sim_node.cpp`.
+- **Purpose**: Historical standalone simulator communicating over ad-hoc ROS 2 topics (`/drake/joint_states`, `/drake/joint_torques`).
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim drake_sim_node
+  ```
+
+### Target 11: `policy_to_command_node` (Legacy Bridge Node)
+- **Source**: `src/policy_to_command_node.cpp`.
+- **Purpose**: Historical controller bridge subscribing to `/drake/joint_states` and streaming raw joint torques over `/drake/joint_torques`.
+- **Execution Command**:
+  ```bash
+  ros2 run humanoid_drake_sim policy_to_command_node
+  ```
+
+---
+
+## 7. Teleoperation, Walking Control & Meshcat Visualization
+
+### 7.1 GUI Velocity Command Pipeline
+- **Publisher**: `base_velocity_controller_gui.py` (`remote_control` package, 25 Hz).
+- **Topic**: `/humanoid/walking_velocity_command` (`humanoid_mpc_msgs/msg/WalkingVelocityCommand`, Best Effort QoS).
+- **Velocity Scaling**:
+  - $v_{x,\text{scaled}} = \text{linear\_velocity\_x} \times 2.4$ m/s
+  - $v_{y,\text{scaled}} = \text{linear\_velocity\_y} \times 1.2$ m/s
+  - $\omega_{z,\text{scaled}} = \text{angular\_velocity\_z} \times 1.0$ rad/s
+  - Default Pelvis Height: $0.7925$ m (corresponds to GUI slider value $\approx 74$).
+
+### 7.2 Locomotion State Machine & Instant Stance Breakout
+In `ProceduralMpcMotionManager.cpp`:
+- Gait mode progression: `stance` (0), `slow_walk` (1), `walk` (2), `trot` (5).
+- In `stance` mode, `linVelErrorThresh = 10.0` m/s.
+- Condition: $|v_{\text{base}}| > v_{\text{max}} - v_{\text{thresh}} = 0.10 - 10.0 = -9.9$ m/s is identically true!
+- Any command $|v_{x,\text{cmd}}| > 0.10$ m/s instantly transitions the robot out of `stance` into `slow_walk` and `walk` without lag.
+
+### 7.3 Exact CLI Commands for Forward & Backward Walking
+- **Forward Walking Command** ($v_x = +0.40$, scaled $0.96$ m/s):
+  ```bash
+  ros2 topic pub --once /humanoid/walking_velocity_command humanoid_mpc_msgs/msg/WalkingVelocityCommand \
+    "{linear_velocity_x: 0.4, linear_velocity_y: 0.0, angular_velocity_z: 0.0, desired_pelvis_height: 0.7925}"
+  ```
+  Criterion: Net forward displacement $\Delta x > +0.30$ m over 5–10 s of simulation time with zero falls.
+
+- **Backward Walking Command** ($v_x = -0.40$, scaled $-0.96$ m/s):
+  ```bash
+  ros2 topic pub --once /humanoid/walking_velocity_command humanoid_mpc_msgs/msg/WalkingVelocityCommand \
+    "{linear_velocity_x: -0.4, linear_velocity_y: 0.0, angular_velocity_z: 0.0, desired_pelvis_height: 0.7925}"
+  ```
+  Criterion: Net backward displacement $\Delta x < -0.20$ m over 5–10 s of simulation time with zero falls.
+
+### 7.4 Meshcat Visualization & Browser Verification
+- **Binding**: Meshcat server binds to `http://localhost:7000`.
+- **Decoupled Architecture**: Zero-timestep diagram updated at 60 Hz; network delays never block 2000 Hz physics.
+- **Scene Hierarchy**:
+  - `/robot`: Root visualizer path.
+  - `/robot/ground_visual`: Grey ground slab ($20 \times 20 \times 0.2$ m).
+  - `/robot/g1/pelvis`: Robot floating base coordinate frame.
+- **Server Status Inspection**:
+  ```text
+  Meshcat server scene: scene=1 ground=1 g1_root=1 clients=...
+  ```
+- **Verification Commands**:
+  ```bash
+  curl -s -I http://localhost:7000 | grep -E "HTTP/1.1 200|OK"
+  ```
+
+---
+
+## 8. Verification Methodology, Anti-Freeze Rules & Acceptance Criteria
+
+### 8.1 Mandatory Build Command
+**NEVER** run raw `colcon build` directly. Always build from the package root:
+```bash
+cd /home/mov/Documents/humanoid_mpc_ws/src/wb_humanoid_mpc && make build-all PARALLEL_JOBS=1
+```
+
+### 8.2 Single Simulation Instance Anti-Freeze Rule
+The host machine has 12 CPU threads. At most **ONE** simulation instance (`drake_mrt_sim_node` or `ros2 launch`) may execute at any time. Running concurrent instances will freeze the machine.
+
+### 8.3 Acceptance Criteria Checklist
+- [ ] Zero modifications to `humanoid_centroidal_mpc`, `humanoid_centroidal_mpc_ros2`, `humanoid_common_mpc`, `humanoid_common_mpc_ros2`, `humanoid_wb_mpc`, `mujoco_sim_interface`, `remote_control`.
+- [ ] `make build-all PARALLEL_JOBS=1` exits with code 0.
+- [ ] `ros2 topic info /g1/mpc_policy` and `/g1/mpc_observation` confirm active publisher/subscriber connections between Node 1 and Node 2.
+- [ ] Process inspection confirms MPC solver is pinned to cores `0-4` and Drake MRT sim is pinned to cores `5-9`.
+- [ ] Unitree G1 stands stably upright ($p_z \in [0.65, 0.90]$ m, $|\text{pitch}| < 0.35$, $|\text{roll}| < 0.35$, $\text{falls} = 0$) for $\ge 15$ seconds.
+- [ ] Forward command ($v_x = 0.4$) produces $\Delta x > 0.30$ m without falls.
+- [ ] Backward command ($v_x = -0.4$) produces $\Delta x < -0.20$ m without falls.
+- [ ] Meshcat server at `http://localhost:7000` reports `scene=1 ground=1 g1_root=1` and renders standing/walking robot cleanly in browser.
+
