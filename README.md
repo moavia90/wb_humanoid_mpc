@@ -2,8 +2,8 @@
 
 This repository contains a Whole-Body Nonlinear Model Predictive Controller (NMPC) for humanoid loco-manipulation control. This approach enables to directly optimize through the **full-order torque-level dynamics in realtime** to generate a wide range of humanoid behaviors building up on an [extended & updated version of ocs2](https://github.com/manumerous/ocs2_ros2)
 
-**Interactive Velocity and Base Height Control via Joystick:**
-![Screencast2024-12-16180254-ezgif com-optimize(3)](https://github.com/user-attachments/assets/d4b1f0da-39ca-4ce1-b53c-e1d040abe1be)
+**Interactive Velocity and Base Height Control:**
+![Drake Simulation Walking](robot_runtime/images/drake_simulation_walking.gif)
 
 
 It contains the following hardware platform agnostic MPC fromulations:
@@ -113,6 +113,17 @@ For the **Whole-Body Dynamics MPC**
 ```
 make launch-wb-g1-dummy-sim
 ```
+
+For the **Drake Physics Simulation (2-Node Architecture)**
+
+Run the production Drake simulation with dedicated CPU core partitioning via `taskset`, 500 Hz MRT policy follower loop, 2000 Hz discrete SAP contact physics, and Meshcat 3D visualization:
+
+```bash
+ros2 launch g1_centroidal_mpc drake_mrt_sim.launch.py
+```
+
+- **Meshcat Visualizer**: Navigate to [http://localhost:7000](http://localhost:7000) in your browser to inspect the 3D scene.
+- **Robot Base Controller GUI**: Use the automatically launched GUI window to command forward/backward walking, lateral stepping, yaw turning, and pelvis height in real time.
 
 #### Interactive Robot Control
 Command a desired base velocity and root link height via **Robot Base Controller GUI** and **XBox Controller Joystick**. For the joystick it is easiest to directly connect via USB. Otherwise you need to install the required bluetooth Xbox controller drivers on your linux system. The GUI application automatically scanns for Joysticks and indicates whether one is connected. 
